@@ -2,11 +2,13 @@
   "design": {
     "design_info": {
       "boundary_crc": "0x0",
+      "device": "xc7a100tcsg324-1",
       "gen_directory": "../../../../pong_project.gen/sources_1/bd/microblaze_v",
       "name": "microblaze_v",
       "rev_ctrl_bd_flag": "RevCtrlBdOff",
       "synth_flow_mode": "Hierarchical",
-      "tool_version": "2024.1"
+      "tool_version": "2024.1",
+      "validated": "true"
     },
     "design_tree": {}
   }
