@@ -92,6 +92,32 @@ wire ddr2_calib_done;
 assign LED[15] = ddr2_calib_done;
 
 // -----------------------------------------------------------------------------
+// Acondicionamiento de entradas — botones y switch
+//
+// Botones: debounce incluye sincronizador de 2 etapas. Salida = pulso de 1
+// ciclo en flanco confirmado de subida (20 ms ventana). El firmware debe usar
+// interrupciones AXI GPIO (canal 1, edge-detect) para capturarlos de forma
+// fiable; el polling directo perdería el pulso.
+//
+// SW: sync_signal de 1 bit elimina metaestabilidad sin alterar el nivel.
+// -----------------------------------------------------------------------------
+wire btn_u_db, btn_d_db, btn_c_db, btn_l_db, btn_r_db;
+wire sw_sync;
+
+debounce u_db_btnu (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNU), .btn_out(btn_u_db));
+debounce u_db_btnd (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTND), .btn_out(btn_d_db));
+debounce u_db_btnc (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNC), .btn_out(btn_c_db));
+debounce u_db_btnl (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNL), .btn_out(btn_l_db));
+debounce u_db_btnr (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNR), .btn_out(btn_r_db));
+
+sync_signal #(.WIDTH(1)) u_sync_sw (
+    .clk      (CLK100MHZ),
+    .rst      (~CPU_RESETN),
+    .async_in (SW),
+    .sync_out (sw_sync)
+);
+
+// -----------------------------------------------------------------------------
 // VRAM Port B — señales internas
 // MicroBlaze escribe por Port A (AXI), FSM de vblank lee estado del juego
 // -----------------------------------------------------------------------------
@@ -114,11 +140,11 @@ microblaze_v_wrapper u_soc (
     // DDR2 calibración completada
     .init_calib_complete_0 (ddr2_calib_done),
 
-    // GPIO0 — botones [4:0] = {BTNR, BTNL, BTNC, BTND, BTNU}
-    .gpio_rtl_0_tri_i      ({BTNR, BTNL, BTNC, BTND, BTNU}),
+    // GPIO0 — botones [4:0] = {BTNR, BTNL, BTNC, BTND, BTNU} (debounced)
+    .gpio_rtl_0_tri_i      ({btn_r_db, btn_l_db, btn_c_db, btn_d_db, btn_u_db}),
 
-    // GPIO1 — SW[0] (modo 1P/2P)
-    .gpio_rtl_1_tri_i      (SW),
+    // GPIO1 — SW[0] (modo 1P/2P, sincronizado)
+    .gpio_rtl_1_tri_i      (sw_sync),
 
     // GPIO2 — LEDs [14:0] (LED[15] reservado para DDR2 calib)
     .gpio_rtl_2_tri_o      (LED[14:0]),
