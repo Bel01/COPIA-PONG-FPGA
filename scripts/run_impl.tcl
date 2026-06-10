@@ -8,6 +8,7 @@
 
 set xpr [lindex $argv 0]
 open_project $xpr
+config_ip_cache -disable_cache
 
 # ── Verificar que la síntesis esté completa ──────────────────────────────────
 set synth_progress [get_property PROGRESS [get_runs synth_1]]
@@ -20,7 +21,7 @@ if {$synth_progress ne "100%"} {
 
 # ── Implementación ───────────────────────────────────────────────────────────
 reset_run impl_1
-launch_runs impl_1 -to_step route_design -jobs 4
+launch_runs impl_1 -to_step route_design -jobs 2
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {
     puts "ERROR: La implementación falló."

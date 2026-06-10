@@ -7,6 +7,7 @@
 
 set xpr [lindex $argv 0]
 open_project $xpr
+config_ip_cache -disable_cache
 
 # ── Wrapper del Block Design ─────────────────────────────────────────────────
 # En un clon limpio el wrapper no existe; hay que generarlo antes de sintetizar.
@@ -28,7 +29,7 @@ if {[llength $bd_files] > 0} {
 
 # ── Síntesis ─────────────────────────────────────────────────────────────────
 reset_run synth_1
-launch_runs synth_1 -jobs 4
+launch_runs synth_1 -jobs 2
 wait_on_run synth_1
 if {[get_property PROGRESS [get_runs synth_1]] ne "100%"} {
     puts "ERROR: La síntesis falló."
@@ -38,7 +39,7 @@ if {[get_property PROGRESS [get_runs synth_1]] ne "100%"} {
 
 # ── Implementación ───────────────────────────────────────────────────────────
 reset_run impl_1
-launch_runs impl_1 -to_step route_design -jobs 4
+launch_runs impl_1 -to_step route_design -jobs 2
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {
     puts "ERROR: La implementación falló."

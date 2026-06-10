@@ -8,6 +8,7 @@
 
 set xpr [lindex $argv 0]
 open_project $xpr
+config_ip_cache -disable_cache
 
 # ── Regenerar todos los outputs del Block Design (incluye MIG) ───────────────
 # Los IPs dentro de un BD son "nested sub-designs" y deben regenerarse vía el BD,
@@ -35,10 +36,20 @@ if {[llength $wrapper_files] == 0} {
     puts "INFO: Wrapper ya existe."
 }
 
+# ── Re-síntesis OOC del clk_wiz (forzar si XCI cambió) ──────────────────────
+set clkwiz_run [get_runs -quiet microblaze_v_clk_wiz_1_0_synth_1]
+if {[llength $clkwiz_run] > 0} {
+    puts "INFO: Reseteando y relanzando síntesis OOC de clk_wiz_1..."
+    reset_run $clkwiz_run
+    launch_runs $clkwiz_run -jobs 2
+    wait_on_run $clkwiz_run
+    puts "INFO: clk_wiz_1 OOC synthesis completada."
+}
+
 # ── Síntesis ─────────────────────────────────────────────────────────────────
 puts "INFO: Lanzando síntesis..."
 reset_run synth_1
-launch_runs synth_1 -jobs 4
+launch_runs synth_1 -jobs 2
 wait_on_run synth_1
 if {[get_property PROGRESS [get_runs synth_1]] ne "100%"} {
     puts "ERROR: La síntesis falló."
@@ -50,7 +61,7 @@ puts "INFO: Síntesis completada."
 # ── Implementación ───────────────────────────────────────────────────────────
 puts "INFO: Lanzando implementación..."
 reset_run impl_1
-launch_runs impl_1 -to_step route_design -jobs 4
+launch_runs impl_1 -to_step route_design -jobs 2
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {
     puts "ERROR: La implementación falló."

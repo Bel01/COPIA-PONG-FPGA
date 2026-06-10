@@ -1998,6 +1998,12 @@
           "clk_wiz_1/clk_in1"
         ]
       },
+      "clk_wiz_1_clk_out2": {
+        "ports": [
+          "clk_wiz_1/clk_out2",
+          "mig_7series_0/clk_ref_i"
+        ]
+      },
       "clk_wiz_1_locked": {
         "ports": [
           "clk_wiz_1/locked",
@@ -2032,12 +2038,6 @@
           "axi_uartlite_0/s_axi_aclk",
           "mig_7series_0/sys_clk_i",
           "rst_clk_wiz_1_100M/slowest_sync_clk"
-        ]
-      },
-      "clk_wiz_1_clk_out2": {
-        "ports": [
-          "clk_wiz_1/clk_out2",
-          "mig_7series_0/clk_ref_i"
         ]
       },
       "microblaze_riscv_0_intr": {
