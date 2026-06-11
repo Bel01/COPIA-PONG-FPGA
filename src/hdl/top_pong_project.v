@@ -21,6 +21,7 @@
  *     Palabra 0 (0x00): {6'b0, ball_y[9:0], 6'b0, ball_x[9:0]}
  *     Palabra 1 (0x04): {6'b0, pad2_y[9:0], 6'b0, pad1_y[9:0]}
  *     Palabra 2 (0x08): {16'b0, score2[7:0], score1[7:0]}
+ *     Palabra 3 (0x0C): {28'b0, selected[1:0], game_state[1:0]}
  *
  * @author JustinAlfaro
  * @date 2026-06-10
@@ -41,7 +42,7 @@ module top_pong_project (
     input  wire        BTNR,            ///< Reservado (declarado, sin función asignada)
 
     // --- Switch modo de juego ---
-    input  wire        SW,              ///< SW[0]: 0 = modo 2P (SPI), 1 = modo 1P (AI)
+    input  wire        SW,              ///< SW[0]: 1 = habilita comunicación SPI en modo 2P
 
     // --- LEDs de estado ---
     output wire [15:0] LED,             ///< [15] = DDR2 calib done; [14:0] = controlados por firmware
@@ -94,21 +95,21 @@ assign LED[15] = ddr2_calib_done;
 // -----------------------------------------------------------------------------
 // Acondicionamiento de entradas — botones y switch
 //
-// Botones: debounce incluye sincronizador de 2 etapas. Salida = pulso de 1
-// ciclo en flanco confirmado de subida (20 ms ventana). El firmware debe usar
-// interrupciones AXI GPIO (canal 1, edge-detect) para capturarlos de forma
-// fiable; el polling directo perdería el pulso.
+// Botones: debounce incluye sincronizador de 2 etapas.
+//   btn_x_db  : pulso de 1 ciclo al confirmarse el flanco (no usable por polling)
+//   btn_x_lvl : nivel estabilizado — lo que MicroBlaze lee via GPIO (polling)
 //
 // SW: sync_signal de 1 bit elimina metaestabilidad sin alterar el nivel.
 // -----------------------------------------------------------------------------
-wire btn_u_db, btn_d_db, btn_c_db, btn_l_db, btn_r_db;
+wire btn_u_db,  btn_d_db,  btn_c_db,  btn_l_db,  btn_r_db;
+wire btn_u_lvl, btn_d_lvl, btn_c_lvl, btn_l_lvl, btn_r_lvl;
 wire sw_sync;
 
-debounce u_db_btnu (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNU), .btn_out(btn_u_db));
-debounce u_db_btnd (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTND), .btn_out(btn_d_db));
-debounce u_db_btnc (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNC), .btn_out(btn_c_db));
-debounce u_db_btnl (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNL), .btn_out(btn_l_db));
-debounce u_db_btnr (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNR), .btn_out(btn_r_db));
+debounce u_db_btnu (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNU), .btn_out(btn_u_db), .btn_level(btn_u_lvl));
+debounce u_db_btnd (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTND), .btn_out(btn_d_db), .btn_level(btn_d_lvl));
+debounce u_db_btnc (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNC), .btn_out(btn_c_db), .btn_level(btn_c_lvl));
+debounce u_db_btnl (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNL), .btn_out(btn_l_db), .btn_level(btn_l_lvl));
+debounce u_db_btnr (.clk(CLK100MHZ), .rst(~CPU_RESETN), .btn_in(BTNR), .btn_out(btn_r_db), .btn_level(btn_r_lvl));
 
 sync_signal #(.WIDTH(1)) u_sync_sw (
     .clk      (CLK100MHZ),
@@ -140,10 +141,10 @@ microblaze_v_wrapper u_soc (
     // DDR2 calibración completada
     .init_calib_complete_0 (ddr2_calib_done),
 
-    // GPIO0 — botones [4:0] = {BTNR, BTNL, BTNC, BTND, BTNU} (debounced)
-    .gpio_rtl_0_tri_i      ({btn_r_db, btn_l_db, btn_c_db, btn_d_db, btn_u_db}),
+    // GPIO0 — botones [4:0] = {BTNR, BTNL, BTNC, BTND, BTNU} (nivel estabilizado)
+    .gpio_rtl_0_tri_i      ({btn_r_lvl, btn_l_lvl, btn_c_lvl, btn_d_lvl, btn_u_lvl}),
 
-    // GPIO1 — SW[0] (modo 1P/2P, sincronizado)
+    // GPIO0 ch2 — SW[0] (habilita SPI, sincronizado)
     .gpio_rtl_1_tri_i      (sw_sync),
 
     // GPIO2 — LEDs [14:0] (LED[15] reservado para DDR2 calib)
