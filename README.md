@@ -38,9 +38,29 @@ microSD ──SPI──► MicroBlaze V ──AXI──► BRAM framebuffer (Por
 
 ---
 
+## Setup para compañeros (primera vez)
+
+El repo incluye el XSA (`top_pong_project.xsa`) y las fuentes (`src/sw/`), pero **no** el workspace de Vitis, ya que contiene rutas absolutas y archivos generados. Un script recrea todo automáticamente:
+
+```bash
+# Requiere: Vivado 2024.1 en /tools/Xilinx  +  Vitis 2024.1 en /tools/Xilinx2
+source /tools/Xilinx2/Vitis/2024.1/settings64.sh
+xsct scripts/create_vitis_app.tcl $(pwd) $(pwd)/../pong_workspace
+```
+
+Esto crea `../pong_workspace/` con la plataforma BSP completa y genera `pong_app.elf`.
+Si Vitis está en otra ruta, ajusta `settings64.sh` y el argumento de workspace.
+
+> **¿Por qué no está el workspace en el repo?**  
+> Los archivos generados contienen rutas absolutas (`/home/usuario/...`) que rompen
+> la compilación en otra máquina. El XSA sí está versionado porque es el contrato
+> hardware–software y no tiene rutas absolutas.
+
+---
+
 ## Cómo programar (JTAG)
 
-### 1. Sintetizar hardware
+### 1. Sintetizar hardware (solo si cambiaste HDL o BD)
 
 ```bash
 source /tools/Xilinx/Vivado/2024.1/settings64.sh
@@ -52,10 +72,11 @@ El bitstream queda en `bin/pong_project-v<TAG>/`.
 
 ### 2. Compilar firmware
 
+Si ya tienes el workspace creado (ver Setup arriba):
+
 ```bash
-# Requiere Vitis en /tools/Xilinx2/Vitis/2024.1
-export PATH=/tools/Xilinx2/Vitis/2024.1/gnu/riscv/lin/riscv64-unknown-elf/bin:$PATH
-cd /ruta/a/pong_workspace/pong_app/build
+source /tools/Xilinx2/Vitis/2024.1/settings64.sh
+cd ../pong_workspace/pong_app/build
 make -j4
 # El error de mb-size al final es cosmético; pong_app.elf se genera igual.
 ```
