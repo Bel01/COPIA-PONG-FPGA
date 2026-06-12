@@ -19,14 +19,16 @@ module debounce #(
 )(
     input  wire clk,     ///< Reloj del sistema
     input  wire rst,     ///< Reset síncrono activo alto
-    input  wire btn_in,  ///< Entrada cruda del botón (con rebotes)
-    output reg  btn_out  ///< Pulso de un ciclo en flanco confirmado de subida
+    input  wire btn_in,   ///< Entrada cruda del botón (con rebotes)
+    output reg  btn_out,  ///< Pulso de un ciclo en flanco confirmado de subida
+    output wire btn_level ///< Nivel sincronizado y estabilizado (para polling)
 );
     localparam integer COUNT_MAX = (CLK_FREQ_HZ / 1000) * DEBOUNCE_MS - 1;
     localparam integer CNT_BITS  = $clog2(COUNT_MAX + 1);
 
     (* ASYNC_REG = "TRUE" *) reg [1:0] sync_ff;
     wire      btn_sync = sync_ff[1];
+    assign    btn_level = btn_sync;
 
     always @(posedge clk) begin
         if (rst) sync_ff <= 2'b00;
