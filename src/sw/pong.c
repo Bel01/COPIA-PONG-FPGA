@@ -53,7 +53,7 @@
 #define PAD_H      60
 #define PAD1_X     20
 #define PAD2_X     612
-#define PAD_SPEED  4
+#define PAD_SPEED  5
 #define SCORE_WIN  10
 
 /* ── Botones (GPIO0 canal 1: bit = {BTNR,BTNL,BTNC,BTND,BTNU}) ──────────── */
@@ -117,6 +117,14 @@ static int     mode_2p;
 static int     sd_ok      = 0;
 static int     sd_sdhc    = 0;
 static int     sprites_ok = 0;
+
+/* Dirty-rect state — evita fb_clear() por frame */
+static int     score_dirty       = 1;
+static int     needs_full_redraw = 1;
+static int     prev_game_state   = -1;
+static int     prev_selected     = -1;
+static int     prev_ball_x, prev_ball_y;
+static int     prev_pad0_y, prev_pad1_y;
 
 static XGpio   gpio0;
 static XGpio   gpio1;
@@ -444,8 +452,8 @@ static void move_ball(void)
     if (ball.y < 0)               { ball.y = 0;              ball.dy = -ball.dy; }
     if (ball.y > FB_H - BALL_SZ)  { ball.y = FB_H - BALL_SZ; ball.dy = -ball.dy; }
 
-    if (ball.x < 0)               { score[1]++; init_game(); return; }
-    if (ball.x > FB_W - BALL_SZ)  { score[0]++; init_game(); return; }
+    if (ball.x < 0)               { score[1]++; score_dirty = 1; init_game(); return; }
+    if (ball.x > FB_W - BALL_SZ)  { score[0]++; score_dirty = 1; init_game(); return; }
 
     /* Colisión paleta izquierda */
     if (collide(&ball, PAD1_X, pad[0].y)) {
@@ -509,49 +517,102 @@ static void update_leds(void)
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void render_frame(void)
 {
-    fb_clear((game_state == ST_MENU) ? COL_BLUE : COL_BLACK);
+    /* Detectar cambio de estado */
+    if (game_state != prev_game_state) {
+        int was_game = (prev_game_state == ST_PLAYING || prev_game_state == ST_PAUSE);
+        int is_game  = (game_state     == ST_PLAYING || game_state     == ST_PAUSE);
+        if (!was_game || !is_game || prev_game_state < 0) {
+            needs_full_redraw = 1;
+            score_dirty       = 1;
+        }
+        /* Al reanudar desde pausa: limpiar overlay */
+        if (prev_game_state == ST_PAUSE && game_state == ST_PLAYING)
+            needs_full_redraw = 1;
+        /* Al entrar en pausa: forzar redibujado del overlay */
+        if (game_state == ST_PAUSE)
+            prev_selected = -1;
+        prev_game_state = game_state;
+    }
 
     switch (game_state) {
 
-    /* ── MENÚ: logo + dos opciones ─────────────────────────────────────── */
+    /* ── MENÚ ─────────────────────────────────────────────────────────── */
     case ST_MENU:
-        if (sprites_ok)
-            fb_blit(288, 60, SPR_LOGO_W, SPR_LOGO_H, spr_logo, 1);
-        fb_fill_rect(220, 175, 200, 45, (selected == 0) ? COL_YELLOW : COL_DGRAY);
-        fb_fill_rect(220, 260, 200, 45, (selected == 1) ? COL_YELLOW : COL_DGRAY);
-        break;
-
-    /* ── JUGANDO + PAUSA ────────────────────────────────────────────────── */
-    case ST_PLAYING:
-    case ST_PAUSE:
-        /* Red central (segmentos de 4×4 px cada 8 px) */
-        for (int ny = 0; ny < FB_H; ny += 8)
-            fb_fill_rect(318, ny, 4, 4, COL_GRAY);
-
-        /* Pelota y paletas (sprite si cargado, rect como fallback) */
-        if (sprites_ok) {
-            fb_blit(ball.x,  ball.y,    SPR_BALL_W, SPR_BALL_H, spr_ball,   1);
-            fb_blit(PAD1_X,  pad[0].y,  SPR_PAD_W,  SPR_PAD_H,  spr_paddle, 0);
-            fb_blit(PAD2_X,  pad[1].y,  SPR_PAD_W,  SPR_PAD_H,  spr_paddle, 0);
-        } else {
-            fb_fill_rect(ball.x,  ball.y,    BALL_SZ, BALL_SZ, COL_WHITE);
-            fb_fill_rect(PAD1_X,  pad[0].y,  PAD_W,   PAD_H,   COL_WHITE);
-            fb_fill_rect(PAD2_X,  pad[1].y,  PAD_W,   PAD_H,   COL_WHITE);
+        if (needs_full_redraw) {
+            fb_clear(COL_BLUE);
+            if (sprites_ok)
+                fb_blit(288, 60, SPR_LOGO_W, SPR_LOGO_H, spr_logo, 1);
+            needs_full_redraw = 0;
+            prev_selected = -1;
         }
-
-        /* Marcador */
-        fb_draw_scores();
-
-        /* Pausa: superpone las dos opciones */
-        if (game_state == ST_PAUSE) {
+        if (prev_selected != selected) {
             fb_fill_rect(220, 175, 200, 45, (selected == 0) ? COL_YELLOW : COL_DGRAY);
             fb_fill_rect(220, 260, 200, 45, (selected == 1) ? COL_YELLOW : COL_DGRAY);
+            prev_selected = selected;
         }
         break;
 
-    /* ── GAMEOVER: barra del color del ganador ──────────────────────────── */
+    /* ── JUGANDO + PAUSA ─────────────────────────────────────────────── */
+    case ST_PLAYING:
+    case ST_PAUSE:
+        if (needs_full_redraw) {
+            fb_clear(COL_BLACK);
+            for (int ny = 0; ny < FB_H; ny += 8)
+                fb_fill_rect(318, ny, 4, 4, COL_GRAY);
+            fb_draw_scores();
+            score_dirty = 0;
+            fb_fill_rect(ball.x, ball.y,   BALL_SZ, BALL_SZ, COL_WHITE);
+            fb_fill_rect(PAD1_X, pad[0].y, PAD_W,   PAD_H,   COL_WHITE);
+            fb_fill_rect(PAD2_X, pad[1].y, PAD_W,   PAD_H,   COL_WHITE);
+            prev_ball_x = ball.x; prev_ball_y = ball.y;
+            prev_pad0_y = pad[0].y; prev_pad1_y = pad[1].y;
+            needs_full_redraw = 0;
+            if (game_state == ST_PAUSE) {
+                fb_fill_rect(220, 175, 200, 45, (selected == 0) ? COL_YELLOW : COL_DGRAY);
+                fb_fill_rect(220, 260, 200, 45, (selected == 1) ? COL_YELLOW : COL_DGRAY);
+                prev_selected = selected;
+            }
+            break;
+        }
+
+        /* Dirty-rect: borrar posiciones anteriores */
+        fb_fill_rect(prev_ball_x, prev_ball_y, BALL_SZ, BALL_SZ, COL_BLACK);
+        if (prev_ball_x + BALL_SZ > 318 && prev_ball_x < 322) {
+            for (int ny = (prev_ball_y / 8) * 8; ny < prev_ball_y + BALL_SZ; ny += 8)
+                if (ny < FB_H) fb_fill_rect(318, ny, 4, 4, COL_GRAY);
+        }
+        fb_fill_rect(PAD1_X, prev_pad0_y, PAD_W, PAD_H, COL_BLACK);
+        fb_fill_rect(PAD2_X, prev_pad1_y, PAD_W, PAD_H, COL_BLACK);
+
+        /* Dibujar en nuevas posiciones */
+        fb_fill_rect(ball.x,  ball.y,   BALL_SZ, BALL_SZ, COL_WHITE);
+        fb_fill_rect(PAD1_X,  pad[0].y, PAD_W,   PAD_H,   COL_WHITE);
+        fb_fill_rect(PAD2_X,  pad[1].y, PAD_W,   PAD_H,   COL_WHITE);
+        prev_ball_x = ball.x; prev_ball_y = ball.y;
+        prev_pad0_y = pad[0].y; prev_pad1_y = pad[1].y;
+
+        /* Marcador: solo cuando cambió */
+        if (score_dirty) {
+            fb_fill_rect(220, 0, 200, 48, COL_BLACK);
+            fb_draw_scores();
+            score_dirty = 0;
+        }
+
+        /* Overlay de pausa: solo cuando cambió la selección */
+        if (game_state == ST_PAUSE && prev_selected != selected) {
+            fb_fill_rect(220, 175, 200, 45, (selected == 0) ? COL_YELLOW : COL_DGRAY);
+            fb_fill_rect(220, 260, 200, 45, (selected == 1) ? COL_YELLOW : COL_DGRAY);
+            prev_selected = selected;
+        }
+        break;
+
+    /* ── GAMEOVER ────────────────────────────────────────────────────── */
     case ST_GAMEOVER:
-        fb_fill_rect(120, 200, 400, 80, (selected == 0) ? COL_GREEN : COL_RED);
+        if (needs_full_redraw) {
+            fb_clear(COL_BLACK);
+            fb_fill_rect(120, 200, 400, 80, (selected == 0) ? COL_GREEN : COL_RED);
+            needs_full_redraw = 0;
+        }
         break;
     }
 }
@@ -639,9 +700,12 @@ int main(void)
         /* ── JUGANDO ────────────────────────────────────────────────────── */
         case ST_PLAYING:
             if (btn & BTN_C) { selected = 0; game_state = ST_PAUSE; break; }
-
-            if (btn & BTN_U) move_local_pad(1, 1);
-            if (btn & BTN_D) move_local_pad(1, 0);
+            {
+                /* Nivel (no flanco) para mover la paleta — permite mantener pulsado */
+                u32 lvl = XGpio_DiscreteRead(&gpio0, 1) & 0x1Fu;
+                if (lvl & BTN_U) move_local_pad(1, 1);
+                if (lvl & BTN_D) move_local_pad(1, 0);
+            }
 
             if (mode_2p && sw_on()) spi_exchange();
             else                    move_ai();
