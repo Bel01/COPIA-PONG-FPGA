@@ -1,107 +1,99 @@
 /**
- * @title Top-level — Sistema Embebido Pong Multijugador
+ * @title Top-level — Sistema Embebido Pong Multijugador (Framebuffer)
  * @file top_pong_project.v
- * @brief Integra el SoC MicroBlaze V con el subsistema VGA de renderizado procedural.
+ * @brief Integra el SoC MicroBlaze V con el subsistema VGA basado en framebuffer BRAM.
  * @details
- *   Arquitectura de dos capas:
+ *   Arquitectura:
+ *     SD card ──SPI──► MicroBlaze ──AXI──► BRAM framebuffer ──Port B──► VGA ──► monitor
+ *                           └──AXI──► DDR2 (sprites + variables)
  *
- *   1. SoC (Block Design microblaze_v_wrapper):
- *      MicroBlaze V (RISC-V bare-metal) + MIG DDR2 128 MB + AXI GPIO/UART/SPI +
- *      BRAM dual-port 32 KB. El firmware actualiza el estado del juego escribiendo
- *      3 palabras de 32 bits en la BRAM via AXI (Port A) cada tick de juego.
+ *   Framebuffer: 640×480 × 4-bit = 38 400 palabras de 32 bits en BRAM True Dual Port.
+ *   MicroBlaze escribe por Port A (32-bit AXI). El VGA lee por Port B en cada pixel.
+ *   Empaquetado: word[31:28]=píxel 0 ... word[3:0]=píxel 7 (big-endian).
  *
- *   2. Subsistema VGA 640x480 @ 60 Hz (renderizado procedural):
- *      Durante el vblank (v_count >= 480) una FSM lee las 3 palabras de estado
- *      desde BRAM Port B y las almacena en registros. Durante el frame activo,
- *      la geometría de cada pixel se calcula combinacionalmente comparando
- *      h_count/v_count contra las posiciones de pelota, paletas y red.
- *      No hay framebuffer: el MicroBlaze solo escribe ~3 palabras por frame.
- *
- *   Mapa de memoria BRAM (Port B word addr = AXI byte addr / 4):
- *     Palabra 0 (0x00): {6'b0, ball_y[9:0], 6'b0, ball_x[9:0]}
- *     Palabra 1 (0x04): {6'b0, pad2_y[9:0], 6'b0, pad1_y[9:0]}
- *     Palabra 2 (0x08): {16'b0, score2[7:0], score1[7:0]}
- *     Palabra 3 (0x0C): {28'b0, selected[1:0], game_state[1:0]}
+ *   Pipeline VGA (1 ciclo a 100 MHz):
+ *     Ciclo 0: addr = f(h_count, v_count) combinacional → BRAM inicia lectura
+ *     Ciclo 1: dout disponible → se registra junto con nibble_sel, blank, hsync, vsync
+ *     Ciclo 1+: paleta aplica y pixel_mux saca RGB
  *
  * @author JustinAlfaro
- * @date 2026-06-10
+ * @date 2026-06-11
  */
 
 `timescale 1ns / 1ps
 
 module top_pong_project (
-    // --- Clock & Reset ---
-    input  wire        CLK100MHZ,       ///< Reloj principal 100 MHz (oscilador onboard)
-    input  wire        CPU_RESETN,      ///< Reset global activo bajo (BTN_CPU_RESET)
+    // Clock & Reset
+    input  wire        CLK100MHZ,
+    input  wire        CPU_RESETN,
 
-    // --- Botones (jugador) ---
-    input  wire        BTNU,            ///< Paleta arriba / navegar menú arriba
-    input  wire        BTND,            ///< Paleta abajo  / navegar menú abajo
-    input  wire        BTNC,            ///< Abrir menú / confirmar selección
-    input  wire        BTNL,            ///< Reservado (declarado, sin función asignada)
-    input  wire        BTNR,            ///< Reservado (declarado, sin función asignada)
+    // Botones (jugador + sistema)
+    input  wire        BTNU,
+    input  wire        BTND,
+    input  wire        BTNC,
+    input  wire        BTNL,
+    input  wire        BTNR,
 
-    // --- Switch modo de juego ---
-    input  wire        SW,              ///< SW[0]: 1 = habilita comunicación SPI en modo 2P
+    // Switch modo de juego
+    input  wire        SW,              ///< SW[0]: 1 = habilita SPI modo 2P
 
-    // --- LEDs de estado ---
-    output wire [15:0] LED,             ///< [15] = DDR2 calib done; [14:0] = controlados por firmware
+    // LEDs
+    output wire [15:0] LED,             ///< [15] = DDR2 calib done
 
-    // --- VGA ---
-    output wire [3:0]  VGA_R,           ///< Canal rojo VGA 4 bits
-    output wire [3:0]  VGA_G,           ///< Canal verde VGA 4 bits
-    output wire [3:0]  VGA_B,           ///< Canal azul VGA 4 bits
-    output wire        VGA_HS,          ///< Sincronismo horizontal activo bajo
-    output wire        VGA_VS,          ///< Sincronismo vertical activo bajo
+    // VGA 640×480 @ 60 Hz
+    output wire [3:0]  VGA_R,
+    output wire [3:0]  VGA_G,
+    output wire [3:0]  VGA_B,
+    output wire        VGA_HS,
+    output wire        VGA_VS,
 
-    // --- UART (USB-UART integrado Nexys A7) ---
-    input  wire        UART_RXD_OUT,    ///< Pin D4: datos USB → FPGA (RX del FPGA)
-    output wire        UART_TXD_IN,     ///< Pin C4: datos FPGA → USB (TX del FPGA)
+    // UART (USB integrado Nexys A7)
+    input  wire        UART_RXD_OUT,
+    output wire        UART_TXD_IN,
 
-    // --- SPI inter-FPGA (pines PMOD por confirmar con el otro grupo) ---
-    output wire        SPI_SCK,         ///< Reloj SPI — TODO: re-exponer sck_io en BD (ausente tras retargeting)
-    inout  wire        SPI_MOSI,        ///< MOSI bidir — IOBUF generado internamente por el BD wrapper
-    inout  wire        SPI_MISO,        ///< MISO bidir — IOBUF generado internamente por el BD wrapper
-    inout  wire [0:0]  SPI_CS_N,        ///< Chip select bidir — IOBUF generado internamente por el BD wrapper
+    // SPI inter-FPGA (PMOD JA — pines por confirmar con el otro grupo)
+    inout  wire        SPI_SCK,
+    inout  wire        SPI_MOSI,
+    inout  wire        SPI_MISO,
+    inout  wire [0:0]  SPI_CS_N,
 
-    // --- DDR2 SDRAM (MT47H64M16HR-25E, 128 MB, 16-bit) ---
-    inout  wire [15:0] ddr2_dq,         ///< Bus de datos bidireccional 16 bits
-    inout  wire [1:0]  ddr2_dqs_p,      ///< Data strobe diferencial positivo
-    inout  wire [1:0]  ddr2_dqs_n,      ///< Data strobe diferencial negativo
-    output wire [12:0] ddr2_addr,       ///< Dirección de fila/columna 13 bits
-    output wire [2:0]  ddr2_ba,         ///< Selección de banco
-    output wire        ddr2_ras_n,      ///< Row address strobe activo bajo
-    output wire        ddr2_cas_n,      ///< Column address strobe activo bajo
-    output wire        ddr2_we_n,       ///< Write enable activo bajo
-    output wire [0:0]  ddr2_ck_p,       ///< Reloj DDR2 diferencial positivo
-    output wire [0:0]  ddr2_ck_n,       ///< Reloj DDR2 diferencial negativo
-    output wire [0:0]  ddr2_cke,        ///< Clock enable
-    output wire [0:0]  ddr2_cs_n,       ///< Chip select activo bajo
-    output wire [1:0]  ddr2_dm,         ///< Data mask (write byte enable)
-    output wire [0:0]  ddr2_odt         ///< On-die termination
+    // SPI microSD (conector onboard Nexys A7: B1/C1/D1/E2)
+    inout  wire        SD_SCK,
+    inout  wire        SD_MOSI,
+    inout  wire        SD_MISO,
+    inout  wire [0:0]  SD_CS_N,
+
+    // DDR2 SDRAM (MT47H64M16HR-25E, 128 MB, 16-bit)
+    inout  wire [15:0] ddr2_dq,
+    inout  wire [1:0]  ddr2_dqs_p,
+    inout  wire [1:0]  ddr2_dqs_n,
+    output wire [12:0] ddr2_addr,
+    output wire [2:0]  ddr2_ba,
+    output wire        ddr2_ras_n,
+    output wire        ddr2_cas_n,
+    output wire        ddr2_we_n,
+    output wire [0:0]  ddr2_ck_p,
+    output wire [0:0]  ddr2_ck_n,
+    output wire [0:0]  ddr2_cke,
+    output wire [0:0]  ddr2_cs_n,
+    output wire [1:0]  ddr2_dm,
+    output wire [0:0]  ddr2_odt
 );
 
-// -----------------------------------------------------------------------------
-// SPI — tras retargeting el wrapper expone _io (inout con IOBUF interno).
-// Los puertos _i/_o/_t son señales internas del wrapper, no accesibles externamente.
-// SCK no quedó expuesto; se mantiene en 0 hasta corregir el Block Design.
-// -----------------------------------------------------------------------------
-assign SPI_SCK = 1'b0;
-
-// DDR2 calibration status (conectar a LED[15] como indicador de arranque)
+// LED[15] = DDR2 calib done; LED[14:0] = firmware via GPIO2 (16-bit wrapper)
 wire ddr2_calib_done;
-assign LED[15] = ddr2_calib_done;
+wire [15:0] led_gpio;
+assign LED[15]  = ddr2_calib_done;
+assign LED[14:0] = led_gpio[14:0];
 
-// -----------------------------------------------------------------------------
-// Acondicionamiento de entradas — botones y switch
-//
-// Botones: debounce incluye sincronizador de 2 etapas.
-//   btn_x_db  : pulso de 1 ciclo al confirmarse el flanco (no usable por polling)
-//   btn_x_lvl : nivel estabilizado — lo que MicroBlaze lee via GPIO (polling)
-//
-// SW: sync_signal de 1 bit elimina metaestabilidad sin alterar el nivel.
-// -----------------------------------------------------------------------------
-wire btn_u_db,  btn_d_db,  btn_c_db,  btn_l_db,  btn_r_db;
+// SCK no expuesto por el wrapper; pines en Z hasta fix del BD
+assign SPI_SCK = 1'bz;
+assign SD_SCK  = 1'bz;
+
+// -------------------------------------------------------------------------
+// Debounce + sincronización de entradas
+// -------------------------------------------------------------------------
+wire btn_u_db, btn_d_db, btn_c_db, btn_l_db, btn_r_db;
 wire btn_u_lvl, btn_d_lvl, btn_c_lvl, btn_l_lvl, btn_r_lvl;
 wire sw_sync;
 
@@ -118,10 +110,9 @@ sync_signal #(.WIDTH(1)) u_sync_sw (
     .sync_out (sw_sync)
 );
 
-// -----------------------------------------------------------------------------
-// VRAM Port B — señales internas
-// MicroBlaze escribe por Port A (AXI), FSM de vblank lee estado del juego
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// VRAM Port B — señales hacia el SoC
+// -------------------------------------------------------------------------
 wire [31:0] vram_portb_addr;
 wire        vram_portb_clk;
 wire [31:0] vram_portb_din;
@@ -130,64 +121,69 @@ wire        vram_portb_en;
 wire        vram_portb_rst;
 wire [3:0]  vram_portb_we;
 
-// -----------------------------------------------------------------------------
-// Instancia del Block Design MicroBlaze V SoC
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// SoC MicroBlaze V
+// -------------------------------------------------------------------------
 microblaze_v_wrapper u_soc (
     // Reloj y reset
-    .clk_100MHz            (CLK100MHZ),
-    .reset_rtl_0           (CPU_RESETN),
+    .clk_100MHz             (CLK100MHZ),
+    .reset_rtl_0            (CPU_RESETN),
 
-    // DDR2 calibración completada
-    .init_calib_complete_0 (ddr2_calib_done),
+    // DDR2 calib done
+    .init_calib_complete_0  (ddr2_calib_done),
 
-    // GPIO0 — botones [4:0] = {BTNR, BTNL, BTNC, BTND, BTNU} (nivel estabilizado)
-    .gpio_rtl_0_tri_i      ({btn_r_lvl, btn_l_lvl, btn_c_lvl, btn_d_lvl, btn_u_lvl}),
+    // GPIO0 — botones [4:0] = {BTNR, BTNL, BTNC, BTND, BTNU}
+    .gpio_rtl_0_tri_i       ({btn_r_lvl, btn_l_lvl, btn_c_lvl, btn_d_lvl, btn_u_lvl}),
 
-    // GPIO0 ch2 — SW[0] (habilita SPI, sincronizado)
-    .gpio_rtl_1_tri_i      (sw_sync),
+    // GPIO1 — SW[0] modo 2P
+    .gpio_rtl_1_tri_i       (sw_sync),
 
-    // GPIO2 — LEDs [14:0] (LED[15] reservado para DDR2 calib)
-    .gpio_rtl_2_tri_o      (LED[14:0]),
+    // GPIO2 — LEDs [15:0] (wrapper 16-bit; LED[15] override por calib_done arriba)
+    .gpio_rtl_2_tri_o       (led_gpio),
 
     // UART
-    .uart_rtl_0_rxd        (UART_RXD_OUT),
-    .uart_rtl_0_txd        (UART_TXD_IN),
+    .uart_rtl_0_rxd         (UART_RXD_OUT),
+    .uart_rtl_0_txd         (UART_TXD_IN),
 
-    // SPI — wrapper genera IOBUFs internamente; conectar _io directo al pad
-    .spi_rtl_0_io0_io      (SPI_MOSI),
-    .spi_rtl_0_io1_io      (SPI_MISO),
-    .spi_rtl_0_ss_io       (SPI_CS_N),
+    // SPI inter-FPGA (AXI Quad SPI 0) — sck_io no existe en wrapper (Vivado omite SCK)
+    .spi_rtl_0_io0_io       (SPI_MOSI),
+    .spi_rtl_0_io1_io       (SPI_MISO),
+    .spi_rtl_0_ss_io        (SPI_CS_N),
+
+    // SPI microSD (AXI Quad SPI 1) — idem, sck_io ausente del wrapper
+    .spi_sd_0_io0_io        (SD_MOSI),
+    .spi_sd_0_io1_io        (SD_MISO),
+    .spi_sd_0_ss_io         (SD_CS_N),
 
     // DDR2
-    .DDR2_0_dq             (ddr2_dq),
-    .DDR2_0_dqs_p          (ddr2_dqs_p),
-    .DDR2_0_dqs_n          (ddr2_dqs_n),
-    .DDR2_0_addr           (ddr2_addr),
-    .DDR2_0_ba             (ddr2_ba),
-    .DDR2_0_ras_n          (ddr2_ras_n),
-    .DDR2_0_cas_n          (ddr2_cas_n),
-    .DDR2_0_we_n           (ddr2_we_n),
-    .DDR2_0_ck_p           (ddr2_ck_p),
-    .DDR2_0_ck_n           (ddr2_ck_n),
-    .DDR2_0_cke            (ddr2_cke),
-    .DDR2_0_cs_n           (ddr2_cs_n),
-    .DDR2_0_dm             (ddr2_dm),
-    .DDR2_0_odt            (ddr2_odt),
+    .DDR2_0_dq              (ddr2_dq),
+    .DDR2_0_dqs_p           (ddr2_dqs_p),
+    .DDR2_0_dqs_n           (ddr2_dqs_n),
+    .DDR2_0_addr            (ddr2_addr),
+    .DDR2_0_ba              (ddr2_ba),
+    .DDR2_0_ras_n           (ddr2_ras_n),
+    .DDR2_0_cas_n           (ddr2_cas_n),
+    .DDR2_0_we_n            (ddr2_we_n),
+    .DDR2_0_ck_p            (ddr2_ck_p),
+    .DDR2_0_ck_n            (ddr2_ck_n),
+    .DDR2_0_cke             (ddr2_cke),
+    .DDR2_0_cs_n            (ddr2_cs_n),
+    .DDR2_0_dm              (ddr2_dm),
+    .DDR2_0_odt             (ddr2_odt),
 
-    // VRAM Port B (VGA lee píxeles directamente)
-    .BRAM_PORTB_0_addr     (vram_portb_addr),
-    .BRAM_PORTB_0_clk      (vram_portb_clk),
-    .BRAM_PORTB_0_din      (vram_portb_din),
-    .BRAM_PORTB_0_dout     (vram_portb_dout),
-    .BRAM_PORTB_0_en       (vram_portb_en),
-    .BRAM_PORTB_0_rst      (vram_portb_rst),
-    .BRAM_PORTB_0_we       (vram_portb_we)
+    // VRAM Port B (lectura del framebuffer por el VGA)
+    .BRAM_PORTB_0_addr      (vram_portb_addr),
+    .BRAM_PORTB_0_clk       (vram_portb_clk),
+    .BRAM_PORTB_0_din       (vram_portb_din),
+    .BRAM_PORTB_0_dout      (vram_portb_dout),
+    .BRAM_PORTB_0_en        (vram_portb_en),
+    .BRAM_PORTB_0_rst       (vram_portb_rst),
+    .BRAM_PORTB_0_we        (vram_portb_we)
 );
 
-// -----------------------------------------------------------------------------
-// Pixel clock 25 MHz — tick_25mhz como clock enable (1 pulso cada 4 ciclos)
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// Pixel clock 25 MHz (clock enable 1 pulso cada 4 ciclos a 100 MHz)
+// -------------------------------------------------------------------------
 wire tick_25mhz;
 
 div_freq #(.DIVISOR(4)) u_div_25mhz (
@@ -196,216 +192,112 @@ div_freq #(.DIVISOR(4)) u_div_25mhz (
     .clk_out (tick_25mhz)
 );
 
-// -----------------------------------------------------------------------------
-// Controlador VGA 640x480 @ 60 Hz
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------
+// Controlador VGA 640×480 @ 60 Hz
+// -------------------------------------------------------------------------
 wire       vga_blank;
 wire [9:0] h_count, v_count;
+wire       vga_hs_int, vga_vs_int;
 
 vga_controller u_vga_ctrl (
     .clk        (CLK100MHZ),
     .rst        (~CPU_RESETN),
     .tick_25mhz (tick_25mhz),
-    .hsync      (VGA_HS),
-    .vsync      (VGA_VS),
+    .hsync      (vga_hs_int),
+    .vsync      (vga_vs_int),
     .blank      (vga_blank),
     .h_count    (h_count),
     .v_count    (v_count)
 );
 
-// -----------------------------------------------------------------------------
-// Estado del juego — registros actualizados desde BRAM durante vblank
+// -------------------------------------------------------------------------
+// Lectura del framebuffer BRAM
 //
-// Mapa de palabras BRAM (Port B word addr = AXI byte addr / 4):
-//   Palabra 0 (AXI 0x00): {6'b0, ball_y[9:0], 6'b0, ball_x[9:0]}
-//   Palabra 1 (AXI 0x04): {6'b0, pad2_y[9:0], 6'b0, pad1_y[9:0]}
-//   Palabra 2 (AXI 0x08): {16'b0, score2[7:0], score1[7:0]}
-// -----------------------------------------------------------------------------
-reg [9:0] gs_ball_x, gs_ball_y;
-reg [9:0] gs_pad1_y, gs_pad2_y;
-reg [7:0] gs_score1, gs_score2;
-reg [1:0] gs_game_state;   // 0=menu 1=playing 2=pause 3=gameover
-reg [1:0] gs_selected;     // opción seleccionada en menú/pausa; ganador en gameover
+// Cada palabra de 32 bits almacena 8 píxeles de 4 bits (big-endian):
+//   word[31:28] = píxel 0 (x%8==0) ... word[3:0] = píxel 7 (x%8==7)
+//
+// pixel_idx  = v_count × 640 + h_count   (0 … 307199)
+// word_addr  = pixel_idx >> 3            (0 … 38399)
+// nibble_sel = pixel_idx[2:0]            (0 … 7)
+// -------------------------------------------------------------------------
+wire [18:0] pixel_idx  = ({9'b0, v_count} * 19'd640) + {9'b0, h_count};
+wire [15:0] word_addr  = pixel_idx[18:3];
+wire [2:0]  nibble_sel = pixel_idx[2:0];
 
-reg [2:0] bram_rd_state;
-
-// Mapa BRAM (word addr):
-//   0: {6'b0, ball_y[9:0], 6'b0, ball_x[9:0]}
-//   1: {6'b0, pad2_y[9:0], 6'b0, pad1_y[9:0]}
-//   2: {16'b0, score2[7:0], score1[7:0]}
-//   3: {28'b0, selected[1:0], game_state[1:0]}
-always @(posedge CLK100MHZ) begin
-    if (!CPU_RESETN) begin
-        bram_rd_state  <= 3'd0;
-        gs_ball_x      <= 10'd316; gs_ball_y  <= 10'd236;
-        gs_pad1_y      <= 10'd210; gs_pad2_y  <= 10'd210;
-        gs_score1      <= 8'd0;    gs_score2  <= 8'd0;
-        gs_game_state  <= 2'd0;    gs_selected <= 2'd0;
-    end else if (v_count >= 10'd480) begin
-        case (bram_rd_state)
-            3'd0: bram_rd_state <= 3'd1;
-            3'd1: begin
-                gs_ball_x     <= vram_portb_dout[9:0];
-                gs_ball_y     <= vram_portb_dout[25:16];
-                bram_rd_state <= 3'd2;
-            end
-            3'd2: begin
-                gs_pad1_y     <= vram_portb_dout[9:0];
-                gs_pad2_y     <= vram_portb_dout[25:16];
-                bram_rd_state <= 3'd3;
-            end
-            3'd3: begin
-                gs_score1     <= vram_portb_dout[7:0];
-                gs_score2     <= vram_portb_dout[15:8];
-                bram_rd_state <= 3'd4;
-            end
-            3'd4: begin
-                gs_game_state <= vram_portb_dout[1:0];
-                gs_selected   <= vram_portb_dout[3:2];
-            end
-            default: bram_rd_state <= 3'd0;
-        endcase
-    end else begin
-        bram_rd_state <= 3'd0;
-    end
-end
-
+assign vram_portb_addr = {14'b0, word_addr, 2'b00}; /* byte-addressed: word × 4 */
 assign vram_portb_clk  = CLK100MHZ;
-assign vram_portb_addr = {29'b0, bram_rd_state};
 assign vram_portb_din  = 32'h0;
-assign vram_portb_en   = (v_count >= 10'd480);
+assign vram_portb_en   = 1'b1;
 assign vram_portb_rst  = ~CPU_RESETN;
 assign vram_portb_we   = 4'b0;
 
-// -----------------------------------------------------------------------------
-// Renderizado procedural — geometría calculada combinacionalmente cada pixel.
-// El firmware escribe 4 palabras de estado en BRAM; la FSM las captura en vblank.
-//
-// Pantallas (gs_game_state):
-//   0 = menú principal  (1P / 2P)
-//   1 = jugando         (pelota, paletas, red, marcador)
-//   2 = pausa           (Reanudar / Salir) + juego difuminado de fondo
-//   3 = gameover        (barra verde=ganaste / roja=perdiste)
-// -----------------------------------------------------------------------------
+// Pipeline 1 ciclo — compensa la latencia de lectura de 1 ciclo de la BRAM.
+// Se registra también hsync/vsync para mantener alineación temporal con el color.
+reg [31:0] bram_dout_r;
+reg [2:0]  nibble_r;
+reg        blank_r;
+reg        hs_r, vs_r;
 
-// --- Juego ---
-localparam BALL_SIZE = 10'd8;
-localparam PAD_W     = 10'd8;
-localparam PAD_H     = 10'd60;
-localparam PAD1_X    = 10'd20;
-localparam PAD2_X    = 10'd612;
+always @(posedge CLK100MHZ) begin
+    bram_dout_r <= vram_portb_dout;
+    nibble_r    <= nibble_sel;
+    blank_r     <= vga_blank;
+    hs_r        <= vga_hs_int;
+    vs_r        <= vga_vs_int;
+end
 
-wire in_ball = (h_count >= gs_ball_x)  && (h_count < gs_ball_x + BALL_SIZE) &&
-               (v_count >= gs_ball_y)  && (v_count < gs_ball_y + BALL_SIZE);
-wire in_pad1 = (h_count >= PAD1_X)    && (h_count < PAD1_X + PAD_W) &&
-               (v_count >= gs_pad1_y) && (v_count < gs_pad1_y + PAD_H);
-wire in_pad2 = (h_count >= PAD2_X)    && (h_count < PAD2_X + PAD_W) &&
-               (v_count >= gs_pad2_y) && (v_count < gs_pad2_y + PAD_H);
-wire in_net  = (h_count >= 10'd318)   && (h_count <= 10'd321) && (v_count[3] == 1'b0);
-
-// --- Parpadeo (~1.5 Hz) ---
-reg [25:0] blink_ctr;
-always @(posedge CLK100MHZ) blink_ctr <= blink_ctr + 1;
-wire blink = blink_ctr[25];
-
-// --- Opciones de menú/pausa (200×40 px, centradas en x=320) ---
-wire in_opt0 = (h_count >= 10'd220) && (h_count < 10'd420) &&
-               (v_count >= 10'd180) && (v_count < 10'd220);
-wire in_opt1 = (h_count >= 10'd220) && (h_count < 10'd420) &&
-               (v_count >= 10'd260) && (v_count < 10'd300);
-
-wire [11:0] opt0_color = (gs_selected == 2'd0) ? (blink ? 12'hFF0 : 12'h000) : 12'h333;
-wire [11:0] opt1_color = (gs_selected == 2'd1) ? (blink ? 12'hFF0 : 12'h000) : 12'h333;
-
-// --- Barra de gameover (400×60 px, centrada) ---
-wire in_winner = (h_count >= 10'd120) && (h_count < 10'd520) &&
-                 (v_count >= 10'd210) && (v_count < 10'd270);
-
-// --- Font 3×5 para marcador (8× escala → 24×40 px por dígito) ---
-// Glifo: {fila0[2:0], fila1[2:0], fila2[2:0], fila3[2:0], fila4[2:0]}
-// bit[2]=col izq, bit[0]=col der
-function [14:0] digit_glyph;
-    input [3:0] d;
-    case (d)
-        4'd0: digit_glyph = 15'b111_101_101_101_111;
-        4'd1: digit_glyph = 15'b010_010_010_010_010;
-        4'd2: digit_glyph = 15'b111_001_111_100_111;
-        4'd3: digit_glyph = 15'b111_001_111_001_111;
-        4'd4: digit_glyph = 15'b101_101_111_001_001;
-        4'd5: digit_glyph = 15'b111_100_111_001_111;
-        4'd6: digit_glyph = 15'b111_100_111_101_111;
-        4'd7: digit_glyph = 15'b111_001_001_001_001;
-        4'd8: digit_glyph = 15'b111_101_111_101_111;
-        4'd9: digit_glyph = 15'b111_101_111_001_111;
-        default: digit_glyph = 15'b0;
-    endcase
-endfunction
-
-// Score 1: esquina superior izquierda en (264, 8); Score 2: (352, 8)
-wire in_s1 = (h_count >= 10'd264) && (h_count < 10'd288) &&
-             (v_count >= 10'd8)   && (v_count < 10'd48);
-wire in_s2 = (h_count >= 10'd352) && (h_count < 10'd376) &&
-             (v_count >= 10'd8)   && (v_count < 10'd48);
-
-wire [1:0] s1_col = (h_count - 10'd264) >> 3;
-wire [2:0] s1_row = (v_count - 10'd8)   >> 3;
-wire [1:0] s2_col = (h_count - 10'd352) >> 3;
-wire [2:0] s2_row = (v_count - 10'd8)   >> 3;
-
-wire [14:0] s1_glyph = digit_glyph(gs_score1[3:0]);
-wire [14:0] s2_glyph = digit_glyph(gs_score2[3:0]);
-
-reg [2:0] s1_rb, s2_rb;
+// Extracción del nibble (big-endian: nibble 0 en bits [31:28])
+reg [3:0] pixel_nibble;
 always @(*) begin
-    case (s1_row)
-        3'd0: s1_rb = s1_glyph[14:12]; 3'd1: s1_rb = s1_glyph[11:9];
-        3'd2: s1_rb = s1_glyph[8:6];   3'd3: s1_rb = s1_glyph[5:3];
-        3'd4: s1_rb = s1_glyph[2:0];   default: s1_rb = 3'b0;
-    endcase
-    case (s2_row)
-        3'd0: s2_rb = s2_glyph[14:12]; 3'd1: s2_rb = s2_glyph[11:9];
-        3'd2: s2_rb = s2_glyph[8:6];   3'd3: s2_rb = s2_glyph[5:3];
-        3'd4: s2_rb = s2_glyph[2:0];   default: s2_rb = 3'b0;
+    case (nibble_r)
+        3'd0: pixel_nibble = bram_dout_r[31:28];
+        3'd1: pixel_nibble = bram_dout_r[27:24];
+        3'd2: pixel_nibble = bram_dout_r[23:20];
+        3'd3: pixel_nibble = bram_dout_r[19:16];
+        3'd4: pixel_nibble = bram_dout_r[15:12];
+        3'd5: pixel_nibble = bram_dout_r[11:8];
+        3'd6: pixel_nibble = bram_dout_r[7:4];
+        3'd7: pixel_nibble = bram_dout_r[3:0];
+        default: pixel_nibble = 4'h0;
     endcase
 end
 
-wire s1_px = in_s1 && (s1_col == 2'd0 ? s1_rb[2] : s1_col == 2'd1 ? s1_rb[1] : s1_rb[0]);
-wire s2_px = in_s2 && (s2_col == 2'd0 ? s2_rb[2] : s2_col == 2'd1 ? s2_rb[1] : s2_rb[0]);
+// Paleta 16 colores: índice 4-bit → RGB 12-bit {R[3:0], G[3:0], B[3:0]}
+reg [11:0] pixel_rgb;
+always @(*) begin
+    case (pixel_nibble)
+        4'h0: pixel_rgb = 12'h000;  // Negro    — fondo
+        4'h1: pixel_rgb = 12'hFFF;  // Blanco   — pelota, paletas
+        4'h2: pixel_rgb = 12'hF00;  // Rojo     — score J2 / derrota
+        4'h3: pixel_rgb = 12'h00F;  // Azul     — score J1
+        4'h4: pixel_rgb = 12'hFF0;  // Amarillo — cursor menú
+        4'h5: pixel_rgb = 12'h0F0;  // Verde    — victoria
+        4'h6: pixel_rgb = 12'hF80;  // Naranja
+        4'h7: pixel_rgb = 12'h888;  // Gris medio — net
+        4'h8: pixel_rgb = 12'h444;  // Gris oscuro — pausa overlay
+        4'h9: pixel_rgb = 12'hF0F;  // Magenta
+        4'hA: pixel_rgb = 12'h0FF;  // Cyan
+        4'hB: pixel_rgb = 12'hFFA;  // Amarillo claro
+        4'hC: pixel_rgb = 12'hA00;  // Rojo oscuro
+        4'hD: pixel_rgb = 12'h0A0;  // Verde oscuro
+        4'hE: pixel_rgb = 12'h00A;  // Azul oscuro
+        4'hF: pixel_rgb = 12'hAAA;  // Gris claro
+        default: pixel_rgb = 12'h000;
+    endcase
+end
 
-// --- Mux de color por pantalla ---
-wire [11:0] pixel_data =
-    (gs_game_state == 2'd0) ? (                          // MENÚ
-        in_opt0 ? opt0_color :
-        in_opt1 ? opt1_color : 12'h000
-    ) :
-    (gs_game_state == 2'd1) ? (                          // JUGANDO
-        (s1_px || s2_px) ? 12'hFF0 :
-        in_ball           ? 12'hFFF :
-        in_pad1           ? 12'hFFF :
-        in_pad2           ? 12'hFFF :
-        in_net            ? 12'h888 : 12'h000
-    ) :
-    (gs_game_state == 2'd2) ? (                          // PAUSA
-        in_opt0 ? opt0_color :
-        in_opt1 ? opt1_color :
-        in_ball ? 12'h444 :
-        in_pad1 ? 12'h444 :
-        in_pad2 ? 12'h444 :
-        in_net  ? 12'h222 : 12'h111
-    ) :
-    (                                                     // GAMEOVER
-        in_winner ? (gs_selected == 2'd0 ? 12'h0F0 : 12'hF00) : 12'h000
-    );
-
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------
 // Salida VGA — pixel_mux apaga RGB durante blanking
-// -----------------------------------------------------------------------------
+// -------------------------------------------------------------------------
 pixel_mux u_pixel_mux (
-    .blank      (vga_blank),
-    .pixel_data (pixel_data),
+    .blank      (blank_r),
+    .pixel_data (pixel_rgb),
     .vga_r      (VGA_R),
     .vga_g      (VGA_G),
     .vga_b      (VGA_B)
 );
+
+assign VGA_HS = hs_r;
+assign VGA_VS = vs_r;
 
 endmodule
