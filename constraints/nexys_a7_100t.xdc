@@ -98,24 +98,23 @@ set_property -dict { PACKAGE_PIN D4  IOSTANDARD LVCMOS33 } [get_ports { UART_RXD
 ## -----------------------------------------------------------------------------
 
 ## -----------------------------------------------------------------------------
-## SPI — por definir (protocolo acordado con otro grupo)
-## Ejemplo: PMOD JA (pines a confirmar segun asignacion)
+## SPI inter-FPGA — PMOD JA (provisional; confirmar pines con el otro grupo)
+## JA1=C17(SCK) JA2=D18(MOSI) JA3=E18(MISO) JA4=G17(CS_N)
 ## -----------------------------------------------------------------------------
-# set_property -dict { PACKAGE_PIN C17 IOSTANDARD LVCMOS33 } [get_ports { SPI_SCK }]
-# set_property -dict { PACKAGE_PIN D18 IOSTANDARD LVCMOS33 } [get_ports { SPI_MOSI }]
-# set_property -dict { PACKAGE_PIN E18 IOSTANDARD LVCMOS33 } [get_ports { SPI_MISO }]
-# set_property -dict { PACKAGE_PIN G17 IOSTANDARD LVCMOS33 } [get_ports { SPI_CS_N }]
+set_property -dict { PACKAGE_PIN C17 IOSTANDARD LVCMOS33 } [get_ports { SPI_SCK }]
+set_property -dict { PACKAGE_PIN D18 IOSTANDARD LVCMOS33 } [get_ports { SPI_MOSI }]
+set_property -dict { PACKAGE_PIN E18 IOSTANDARD LVCMOS33 } [get_ports { SPI_MISO }]
+set_property -dict { PACKAGE_PIN G17 IOSTANDARD LVCMOS33 } [get_ports { SPI_CS_N[0] }]
 
 ## -----------------------------------------------------------------------------
 ## microSD — conector integrado de la Nexys A7
-## Manejado por el IP AXI Quad SPI en el block design.
+## SPI mode: SCK=B1(sd_sck) MOSI=C1(sd_cmd) MISO=C2(sd_dat[0]) CS_N=D2(sd_dat[3])
+## SD_CD=A1 SD_RESET=E2 — no conectados al SPI IP
 ## -----------------------------------------------------------------------------
-# set_property -dict { PACKAGE_PIN E2  IOSTANDARD LVCMOS33 } [get_ports { SD_RESET }]
-# set_property -dict { PACKAGE_PIN A1  IOSTANDARD LVCMOS33 } [get_ports { SD_CD }]
-# set_property -dict { PACKAGE_PIN B1  IOSTANDARD LVCMOS33 } [get_ports { SD_SCK }]
-# set_property -dict { PACKAGE_PIN C1  IOSTANDARD LVCMOS33 } [get_ports { SD_MOSI }]
-# set_property -dict { PACKAGE_PIN D1  IOSTANDARD LVCMOS33 } [get_ports { SD_MISO }]
-# set_property -dict { PACKAGE_PIN E1  IOSTANDARD LVCMOS33 } [get_ports { SD_CS }]
+set_property -dict { PACKAGE_PIN B1  IOSTANDARD LVCMOS33 } [get_ports { SD_SCK }]
+set_property -dict { PACKAGE_PIN C1  IOSTANDARD LVCMOS33 } [get_ports { SD_MOSI }]
+set_property -dict { PACKAGE_PIN C2  IOSTANDARD LVCMOS33 } [get_ports { SD_MISO }]
+set_property -dict { PACKAGE_PIN D2  IOSTANDARD LVCMOS33 } [get_ports { SD_CS_N[0] }]
 
 ## =============================================================================
 ## Excepciones de temporización — puertos sin requisito de tiempo externo
@@ -133,12 +132,14 @@ set_false_path -from [get_ports {SW}]
 set_false_path -from [get_ports {CPU_RESETN}]
 set_false_path -from [get_ports {UART_RXD_OUT}]
 set_false_path -from [get_ports {SPI_MOSI SPI_MISO}]
+set_false_path -from [get_ports {SD_MISO}]
 
 ## Salidas asíncronas
 set_false_path -to [get_ports {LED[*]}]
 set_false_path -to [get_ports {VGA_R[*] VGA_G[*] VGA_B[*] VGA_HS VGA_VS}]
 set_false_path -to [get_ports {UART_TXD_IN}]
 set_false_path -to [get_ports {SPI_MOSI SPI_MISO SPI_CS_N[*]}]
+set_false_path -to [get_ports {SD_MOSI SD_SCK SD_CS_N[*]}]
 
 ## =============================================================================
 ## Waivers — artefactos conocidos del IP Clock Wizard en Block Design
