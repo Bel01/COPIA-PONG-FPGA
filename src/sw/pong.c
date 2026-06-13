@@ -35,6 +35,12 @@
 #define FB_H     480
 #define FB_WORDS 38400   /* (640×480) / 8 */
 
+/* ── DDR2 (MIG 7-series, calibración automática al arrancar) ────────────── */
+#define DDR2_BASE       XPAR_MIG_0_BASEADDRESS
+#define DDR2_SPR_BALL   ((u8 *)(DDR2_BASE + 0x40000UL))  /* 32 B,  tras 256 KB de código */
+#define DDR2_SPR_PADDLE ((u8 *)(DDR2_BASE + 0x40020UL))  /* 240 B */
+#define DDR2_SPR_LOGO   ((u8 *)(DDR2_BASE + 0x40110UL))  /* 512 B */
+
 /* ── Paleta (debe coincidir con top_pong_project.v) ──────────────────────── */
 #define COL_BLACK   0
 #define COL_WHITE   1
@@ -48,6 +54,7 @@
 #define COL_MAGENTA 9
 
 /* ── Geometría del juego ──────────────────────────────────────────────────── */
+#define BALL_TICK_DIV 2    /* pelota avanza 1 de cada N frames; paletas siempre a 70 Hz */
 #define BALL_SZ    8
 #define PAD_W      8
 #define PAD_H      60
@@ -95,9 +102,7 @@ typedef struct { int y; }             pad_t;
 #define SPR_LOGO_W   64
 #define SPR_LOGO_H   16
 
-static u8 spr_ball  [SPR_BALL_W * SPR_BALL_H  / 2];   /* 32 B  */
-static u8 spr_paddle[SPR_PAD_W  * SPR_PAD_H   / 2];   /* 240 B */
-static u8 spr_logo  [SPR_LOGO_W * SPR_LOGO_H  / 2];   /* 512 B */
+/* Sprites viven en DDR2 — ver DDR2_SPR_BALL / _PADDLE / _LOGO */
 static u8 sd_sector_buf[512];
 
 /* Layout de sectores en la SD (LBA, antes de la partición → sector 0 = MBR) */
@@ -119,6 +124,7 @@ static int     sd_sdhc    = 0;
 static int     sprites_ok = 0;
 
 /* Dirty-rect state — evita fb_clear() por frame */
+static int     ball_tick         = 0;
 static int     score_dirty       = 1;
 static int     needs_full_redraw = 1;
 static int     prev_game_state   = -1;
@@ -374,14 +380,19 @@ static void load_sprites(void)
                 ((u32)sd_sector_buf[2] <<  8) |  (u32)sd_sector_buf[3];
     if (magic != SD_MAGIC) return;
 
-    if (sd_read_block(SD_LBA_BALL,   sd_sector_buf) != 0) return;
-    for (int i = 0; i < (int)sizeof(spr_ball);   i++) spr_ball[i]   = sd_sector_buf[i];
+    u8 *dst;
+
+    if (sd_read_block(SD_LBA_BALL, sd_sector_buf) != 0) return;
+    dst = DDR2_SPR_BALL;
+    for (int i = 0; i < SPR_BALL_W * SPR_BALL_H / 2; i++) dst[i] = sd_sector_buf[i];
 
     if (sd_read_block(SD_LBA_PADDLE, sd_sector_buf) != 0) return;
-    for (int i = 0; i < (int)sizeof(spr_paddle); i++) spr_paddle[i] = sd_sector_buf[i];
+    dst = DDR2_SPR_PADDLE;
+    for (int i = 0; i < SPR_PAD_W * SPR_PAD_H / 2; i++) dst[i] = sd_sector_buf[i];
 
-    if (sd_read_block(SD_LBA_LOGO,   sd_sector_buf) != 0) return;
-    for (int i = 0; i < (int)sizeof(spr_logo);   i++) spr_logo[i]   = sd_sector_buf[i];
+    if (sd_read_block(SD_LBA_LOGO, sd_sector_buf) != 0) return;
+    dst = DDR2_SPR_LOGO;
+    for (int i = 0; i < SPR_LOGO_W * SPR_LOGO_H / 2; i++) dst[i] = sd_sector_buf[i];
 
     sprites_ok = 1;
 }
@@ -394,10 +405,12 @@ static void init_game(void)
 {
     ball.x  = FB_W / 2;
     ball.y  = FB_H / 2;
-    ball.dx = 2;
-    ball.dy = 2;
+    ball.dx = 4;
+    ball.dy = 3;
     pad[0].y = (FB_H - PAD_H) / 2;
     pad[1].y = (FB_H - PAD_H) / 2;
+    ball_tick = 0;
+    needs_full_redraw = 1;   /* sincroniza prev_pad*_y tras salto de posición */
 }
 
 static int collide(ball_t *b, int px, int py)
@@ -541,7 +554,7 @@ static void render_frame(void)
         if (needs_full_redraw) {
             fb_clear(COL_BLUE);
             if (sprites_ok)
-                fb_blit(288, 60, SPR_LOGO_W, SPR_LOGO_H, spr_logo, 1);
+                fb_blit(288, 60, SPR_LOGO_W, SPR_LOGO_H, DDR2_SPR_LOGO, 1);
             needs_full_redraw = 0;
             prev_selected = -1;
         }
@@ -581,15 +594,40 @@ static void render_frame(void)
             for (int ny = (prev_ball_y / 8) * 8; ny < prev_ball_y + BALL_SZ; ny += 8)
                 if (ny < FB_H) fb_fill_rect(318, ny, 4, 4, COL_GRAY);
         }
-        fb_fill_rect(PAD1_X, prev_pad0_y, PAD_W, PAD_H, COL_BLACK);
-        fb_fill_rect(PAD2_X, prev_pad1_y, PAD_W, PAD_H, COL_BLACK);
+        if (prev_ball_y < 48) score_dirty = 1;  /* restaurar marcador si pelota pasó por ahí */
+        /* Delta-rect paddles: solo los strips que cambian */
+        if (pad[0].y != prev_pad0_y) {
+            int dy = pad[0].y - prev_pad0_y;
+            if (dy < 0 && -dy < PAD_H) {
+                fb_fill_rect(PAD1_X, pad[0].y,         PAD_W, -dy, COL_WHITE);
+                fb_fill_rect(PAD1_X, pad[0].y + PAD_H, PAD_W, -dy, COL_BLACK);
+            } else if (dy > 0 && dy < PAD_H) {
+                fb_fill_rect(PAD1_X, prev_pad0_y,         PAD_W, dy, COL_BLACK);
+                fb_fill_rect(PAD1_X, prev_pad0_y + PAD_H, PAD_W, dy, COL_WHITE);
+            } else {
+                fb_fill_rect(PAD1_X, prev_pad0_y, PAD_W, PAD_H, COL_BLACK);
+                fb_fill_rect(PAD1_X, pad[0].y,    PAD_W, PAD_H, COL_WHITE);
+            }
+            prev_pad0_y = pad[0].y;
+        }
+        if (pad[1].y != prev_pad1_y) {
+            int dy = pad[1].y - prev_pad1_y;
+            if (dy < 0 && -dy < PAD_H) {
+                fb_fill_rect(PAD2_X, pad[1].y,         PAD_W, -dy, COL_WHITE);
+                fb_fill_rect(PAD2_X, pad[1].y + PAD_H, PAD_W, -dy, COL_BLACK);
+            } else if (dy > 0 && dy < PAD_H) {
+                fb_fill_rect(PAD2_X, prev_pad1_y,         PAD_W, dy, COL_BLACK);
+                fb_fill_rect(PAD2_X, prev_pad1_y + PAD_H, PAD_W, dy, COL_WHITE);
+            } else {
+                fb_fill_rect(PAD2_X, prev_pad1_y, PAD_W, PAD_H, COL_BLACK);
+                fb_fill_rect(PAD2_X, pad[1].y,    PAD_W, PAD_H, COL_WHITE);
+            }
+            prev_pad1_y = pad[1].y;
+        }
 
-        /* Dibujar en nuevas posiciones */
-        fb_fill_rect(ball.x,  ball.y,   BALL_SZ, BALL_SZ, COL_WHITE);
-        fb_fill_rect(PAD1_X,  pad[0].y, PAD_W,   PAD_H,   COL_WHITE);
-        fb_fill_rect(PAD2_X,  pad[1].y, PAD_W,   PAD_H,   COL_WHITE);
+        /* Pelota en nueva posición */
+        fb_fill_rect(ball.x, ball.y, BALL_SZ, BALL_SZ, COL_WHITE);
         prev_ball_x = ball.x; prev_ball_y = ball.y;
-        prev_pad0_y = pad[0].y; prev_pad1_y = pad[1].y;
 
         /* Marcador: solo cuando cambió */
         if (score_dirty) {
@@ -615,6 +653,66 @@ static void render_frame(void)
         }
         break;
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * DDR2 — init y sprites por defecto
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void ddr2_init(void)
+{
+    /* MIG 7-series calibra solo al arrancar; calib_done sale en LED[15].
+     * Sin señal accesible al CPU, se espera el peor caso documentado. */
+    usleep(350000);
+}
+
+/*
+ * Escribe 4 patrones en DDR2 y los lee de vuelta.
+ * Muestra en LED[3:0] qué palabras pasaron (bit N = palabra N OK).
+ * LED[15] = calib_done (siempre encendido si MIG calibró).
+ * Resultado visible 2 segundos antes de que arranque el juego.
+ */
+static void ddr2_selftest(void)
+{
+    static const u32 pat[4] = {
+        0xDEADBEEFu, 0x12345678u, 0xA5A5A5A5u, 0x0F0F0F0Fu
+    };
+    u32 base = DDR2_BASE + 0x20000UL;   /* 128 KB dentro de DDR2, lejos del código */
+    u32 result = 0;
+
+    for (int i = 0; i < 4; i++)
+        Xil_Out32(base + (u32)(i * 4), pat[i]);
+
+    for (int i = 0; i < 4; i++)
+        if (Xil_In32(base + (u32)(i * 4)) == pat[i])
+            result |= (1u << i);
+
+    /* Mostrar en LED[3:0]: cada bit = palabra i correcta */
+    XGpio_DiscreteWrite(&gpio1, 1, result);
+    usleep(2000000);   /* 2 s para que el usuario vea los LEDs */
+    XGpio_DiscreteWrite(&gpio1, 1, 0);
+}
+
+static void ddr2_sprite_defaults(void)
+{
+    /* Ball y paddle: blanco sólido (nibble COL_WHITE=1 → byte 0x11).
+     * Logo: negro/transparente hasta que la SD esté lista. */
+    u32 addr;
+    int i;
+
+    addr = (u32)(uintptr_t)DDR2_SPR_BALL;
+    for (i = 0; i < SPR_BALL_W * SPR_BALL_H / 8; i++)
+        Xil_Out32(addr + (u32)(i * 4), 0x11111111u);
+
+    addr = (u32)(uintptr_t)DDR2_SPR_PADDLE;
+    for (i = 0; i < SPR_PAD_W * SPR_PAD_H / 8; i++)
+        Xil_Out32(addr + (u32)(i * 4), 0x11111111u);
+
+    addr = (u32)(uintptr_t)DDR2_SPR_LOGO;
+    for (i = 0; i < SPR_LOGO_W * SPR_LOGO_H / 8; i++)
+        Xil_Out32(addr + (u32)(i * 4), 0x00000000u);
+
+    sprites_ok = 1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -667,15 +765,19 @@ int main(void)
     XSpi_Start(&spi);
     XSpi_IntrGlobalDisable(&spi);
 
-    /* Estado inicial + frame de "cargando" (pantalla azul) antes de SD */
+    /* DDR2: esperar calibración MIG, verificar R/W y cargar sprites por defecto */
+    ddr2_init();
+    ddr2_selftest();
+    ddr2_sprite_defaults();
+
+    /* Estado inicial */
     game_state = ST_MENU;
     selected   = 0;
     mode_2p    = 0;
     score[0]   = score[1] = 0;
     init_game();
     /* SD desactivado temporalmente — AXI fault en SPI1, depurar después */
-    sd_ok     = 0;
-    sprites_ok = 0;
+    sd_ok = 0;
 
     /* Frame inicial del menú */
     render_frame();
@@ -710,7 +812,7 @@ int main(void)
             if (mode_2p && sw_on()) spi_exchange();
             else                    move_ai();
 
-            move_ball();
+            if (++ball_tick >= BALL_TICK_DIV) { ball_tick = 0; move_ball(); }
             update_leds();
 
             if (check_score()) game_state = ST_GAMEOVER;
@@ -733,8 +835,7 @@ int main(void)
         }
 
         render_frame();
-        /* ~60 Hz: busy-wait ~1 500 000 ciclos a 100 MHz ≈ 15 ms */
-        { volatile u32 _d = 1500000u; while (_d--) ; }
+        usleep(8000);   /* ~8 ms/frame → ~70 Hz con overhead de render */
     }
 
     return 0;
