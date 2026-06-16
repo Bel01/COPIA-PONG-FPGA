@@ -22,6 +22,7 @@
 #include "xgpio.h"
 #include "xspi.h"
 #include "xil_io.h"
+#include "xil_printf.h"
 #include "sleep.h"
 
 /* ── SD SPI: dirección provisional hasta rebuild de plataforma ─────────── */
@@ -285,7 +286,9 @@ static u8 sd_spi_byte(u8 tx)
 
 /*
  * Inicializa la SD en modo SPI.
- * Retorna 0 si OK, -1 si falla (el juego continúa igualmente).
+ * Retorna  0: OK
+ *         -1: CMD0 sin respuesta (tarjeta no detectada o SCK no llega)
+ *         -2: ACMD41 timeout (tarjeta no sale de idle — posible SD dañada)
  */
 static int sd_init(void)
 {
@@ -325,7 +328,7 @@ static int sd_init(void)
         tries++;
     } while (r1 != 0x00 && tries < 200);
 
-    if (r1 != 0x00) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -1; }
+    if (r1 != 0x00) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -2; }
 
     /* CMD58: READ_OCR — detectar SDHC (bit CCS en OCR[30]) */
     const u8 cmd58[] = {0x7A, 0x00, 0x00, 0x00, 0x00, 0x01};
@@ -367,6 +370,56 @@ static int sd_read_block(u32 lba, u8 *buf)
 
     Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);   /* CS deassert */
     return 0;
+}
+
+/*
+ * Test de diagnóstico de la SD — imprime resultados por UART.
+ * Retorna 1 si la SD quedó lista, 0 si falló (el juego sigue igual).
+ *
+ * Secuencia:
+ *   1. sd_init()  — negociación SPI + detección SDHC
+ *   2. Leer sector 0 (MBR) — verifica que SCK/MOSI/MISO funcionen
+ *   3. Comprobar firma MBR 0x55AA en bytes 510-511
+ */
+static int sd_run_test(void)
+{
+    xil_printf("\r\n=== SD TEST ===\r\n");
+
+    int rc = sd_init();
+    if (rc == -1) {
+        xil_printf("FAIL CMD0: tarjeta no responde "
+                   "(verificar SD_RESET=0, SCK llega al pin B1)\r\n");
+        return 0;
+    }
+    if (rc == -2) {
+        xil_printf("FAIL ACMD41: tarjeta no sale de idle "
+                   "(timeout 200 intentos)\r\n");
+        return 0;
+    }
+    xil_printf("PASS init: SD lista, tipo=%s\r\n",
+               sd_sdhc ? "SDHC/SDXC" : "SDSC");
+
+    /* Leer sector 0 (MBR) */
+    if (sd_read_block(0, sd_sector_buf) != 0) {
+        xil_printf("FAIL read LBA0: CMD17 sin token de datos\r\n");
+        return 0;
+    }
+    xil_printf("PASS read LBA0: primeros 4 bytes = %02X %02X %02X %02X\r\n",
+               sd_sector_buf[0], sd_sector_buf[1],
+               sd_sector_buf[2], sd_sector_buf[3]);
+
+    /* Verificar firma MBR */
+    if (sd_sector_buf[510] == 0x55 && sd_sector_buf[511] == 0xAA) {
+        xil_printf("PASS MBR: firma 0x55AA encontrada\r\n");
+    } else {
+        xil_printf("WARN MBR: firma no encontrada "
+                   "(bytes 510-511 = %02X %02X) "
+                   "-- SD sin particionar o tarjeta en blanco\r\n",
+                   sd_sector_buf[510], sd_sector_buf[511]);
+    }
+
+    xil_printf("=== SD TEST OK ===\r\n\r\n");
+    return 1;
 }
 
 /* Carga los sprites desde los sectores reservados de la SD. */
@@ -776,8 +829,7 @@ int main(void)
     mode_2p    = 0;
     score[0]   = score[1] = 0;
     init_game();
-    /* SD desactivado temporalmente — AXI fault en SPI1, depurar después */
-    sd_ok = 0;
+    sd_ok = sd_run_test();
 
     /* Frame inicial del menú */
     render_frame();
