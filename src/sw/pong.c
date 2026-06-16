@@ -77,18 +77,22 @@
 #define ST_PAUSE    2
 #define ST_GAMEOVER 3
 
-/* ── AXI Quad SPI registros (offset desde base) ──────────────────────────── */
-#define SPI_SRR   0x00u   /* Software Reset */
+/* ── AXI Quad SPI registros (offset desde base, PG153 v3.2) ─────────────── */
+#define SPI_SRR   0x40u   /* Software Reset Register (offset 0x40, no 0x00!) */
 #define SPI_CR    0x60u   /* Control Register */
 #define SPI_SR    0x64u   /* Status Register */
 #define SPI_DTR   0x68u   /* TX FIFO */
 #define SPI_DRR   0x6Cu   /* RX FIFO */
 #define SPI_SSR   0x70u   /* Slave Select (activo bajo) */
 
+#define SPICR_RXRST    (1u << 6)   /* Reset RX FIFO */
+#define SPICR_TXRST    (1u << 5)   /* Reset TX FIFO */
 #define SPICR_INHIBIT  (1u << 8)
 #define SPICR_MANSS    (1u << 7)
 #define SPICR_MASTER   (1u << 2)
 #define SPICR_SPE      (1u << 1)
+#define SPICR_LOOP     (1u << 0)   /* Loopback: MOSI → MISO internamente */
+#define SPISR_RX_EMPTY (1u << 0)   /* 1 = RX FIFO vacío */
 #define SPISR_TX_EMPTY (1u << 2)
 
 /* ── Tipos ───────────────────────────────────────────────────────────────── */
@@ -121,6 +125,17 @@ static int     game_state;
 static int     selected;
 static int     mode_2p;
 static int     sd_ok      = 0;
+static int     sd_init_rc    = 0;   /* -1=CMD0 sin resp, -2=ACMD41 timeout, 0=OK */
+static u8      sd_acmd41_r1  = 0xFF; /* ultimo R1 de CMD41 (0x00=OK, 0x01=idle, 0xFF=sin resp) */
+static u8      sd_cmd55_r1   = 0xFF; /* ultimo R1 de CMD55 (para diagnóstico) */
+static u8      sd_cmd8_r1    = 0xFF; /* R1 de CMD8 (0x01=SDHC, 0x05=SDSC/illegal, 0xFF=sin resp) */
+static int     sd_acmd41_try = 0;    /* intentos hasta que termino el loop */
+static int     sd_loopback_ok = -1;  /* 1=IP SPI ok, 0=IP roto, -1=no testeado */
+static u8      sd_cmd0_r1    = 0xFF; /* respuesta real de CMD0 */
+static u8      sd_read_r1    = 0xFF; /* R1 de CMD17 (debe ser 0x00) */
+static u8      sd_read_token = 0xFF; /* token de datos (debe ser 0xFE) */
+static u8      sd_cmd58_r1   = 0xFF; /* R1 de CMD58 (debe ser 0x00) */
+static u8      sd_ocr0       = 0xFF; /* OCR byte 0 [31:24]: bit6=CCS */
 static int     sd_sdhc    = 0;
 static int     sprites_ok = 0;
 
@@ -267,21 +282,47 @@ static void fb_blit(int x, int y, int w, int h, const u8 *spr, int transparent)
 
 static void sd_spi_setup(void)
 {
-    Xil_Out32(SD_BASE + SPI_SRR, 0x0Au);    /* reset IP */
-    /* master, manual SS, transfer inhibited, SPE */
+    /* Software reset AXI Quad SPI (SRR offset correcto: 0x40) */
+    Xil_Out32(SD_BASE + SPI_SRR, 0x0Au);
+    usleep(100);
+    /* Resetear TX y RX FIFOs via bits CR[5:6] */
+    Xil_Out32(SD_BASE + SPI_CR,
+              SPICR_INHIBIT | SPICR_MANSS | SPICR_MASTER | SPICR_SPE |
+              SPICR_TXRST | SPICR_RXRST);
+    usleep(10);
+    /* Modo normal: master, manual SS, transfer inhibited, SPE */
     Xil_Out32(SD_BASE + SPI_CR, SPICR_INHIBIT | SPICR_MANSS | SPICR_MASTER | SPICR_SPE);
     Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);   /* CS desasertado */
 }
 
 static u8 sd_spi_byte(u8 tx)
 {
+    /* Drenar RX FIFO de datos obsoletos antes de iniciar nueva transferencia */
+    while (!(Xil_In32(SD_BASE + SPI_SR) & SPISR_RX_EMPTY))
+        (void)Xil_In32(SD_BASE + SPI_DRR);
+
     u32 cr = Xil_In32(SD_BASE + SPI_CR);
     Xil_Out32(SD_BASE + SPI_DTR, tx);
-    Xil_Out32(SD_BASE + SPI_CR, cr & ~SPICR_INHIBIT);
-    for (int t = 0; t < 100000; t++)
-        if (Xil_In32(SD_BASE + SPI_SR) & SPISR_TX_EMPTY) break;
-    Xil_Out32(SD_BASE + SPI_CR, cr);
+    Xil_Out32(SD_BASE + SPI_CR, cr & ~SPICR_INHIBIT);  /* iniciar transferencia */
+
+    /* Esperar TX vacío Y RX con dato: garantiza que el shift register terminó */
+    for (int t = 0; t < 100000; t++) {
+        u32 sr = Xil_In32(SD_BASE + SPI_SR);
+        if ((sr & SPISR_TX_EMPTY) && !(sr & SPISR_RX_EMPTY)) break;
+    }
+    Xil_Out32(SD_BASE + SPI_CR, cr);  /* detener transferencia (INHIBIT) */
     return (u8)Xil_In32(SD_BASE + SPI_DRR);
+}
+
+/* Verifica que el IP AXI Quad SPI funcione enviando 0x5A en loopback.
+ * Retorna 1 si el byte enviado = byte recibido, 0 si hay error. */
+static int sd_loopback_test(void)
+{
+    u32 cr = Xil_In32(SD_BASE + SPI_CR);
+    Xil_Out32(SD_BASE + SPI_CR, cr | SPICR_LOOP);   /* activar loopback */
+    u8 echo = sd_spi_byte(0x5A);
+    Xil_Out32(SD_BASE + SPI_CR, cr);                  /* desactivar loopback */
+    return (echo == 0x5A) ? 1 : 0;
 }
 
 /*
@@ -298,44 +339,96 @@ static int sd_init(void)
     Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
     for (int i = 0; i < 10; i++) sd_spi_byte(0xFF);
 
-    /* Aserta CS[0] */
+    /* Aserta CS[0] — CMD0 en SPI mode requiere CS bajo ANTES del primer bit */
     Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
 
-    /* CMD0: GO_IDLE_STATE — espera R1=0x01 */
+    /* CMD0: GO_IDLE_STATE — espera R1=0x01
+     * Reintentar hasta 10 veces (con gap inter-cmd) en caso de mala sincronización. */
     const u8 cmd0[] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x95};
-    for (int i = 0; i < 6; i++) sd_spi_byte(cmd0[i]);
     u8 r1 = 0xFF;
-    for (int i = 0; i < 10 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
+    for (int attempt = 0; attempt < 10 && r1 != 0x01; attempt++) {
+        for (int i = 0; i < 6; i++) sd_spi_byte(cmd0[i]);
+        r1 = 0xFF;
+        for (int i = 0; i < 10 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
+        if (r1 != 0x01) {
+            /* Gap inter-comando: desaserta CS, 8 clocks, reaserta */
+            Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
+            for (int i = 0; i < 1; i++) sd_spi_byte(0xFF);
+            Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
+            usleep(1000);
+        }
+    }
+    sd_cmd0_r1 = r1;
     if (r1 != 0x01) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -1; }
 
-    /* CMD8: SEND_IF_COND (SDHC check) */
+    /* Gap post-CMD0: desaserta CS + 8 clocks + reaserta */
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
+    for (int i = 0; i < 1; i++) sd_spi_byte(0xFF);
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
+
+    /* CMD8: SEND_IF_COND (SDHC check)
+     * R1=0x01 → SDHC (consume 4 echo bytes R7)
+     * R1=0x05 → SDSC legacy (no echo)
+     * R1=0xFF → no responde (tarjeta antigua o sin soporte) */
     const u8 cmd8[] = {0x48, 0x00, 0x00, 0x01, 0xAA, 0x87};
     for (int i = 0; i < 6; i++) sd_spi_byte(cmd8[i]);
-    for (int i = 0; i < 5; i++) sd_spi_byte(0xFF);   /* consume R7 */
+    u8 r8 = 0xFF;
+    for (int i = 0; i < 8 && r8 == 0xFF; i++) r8 = sd_spi_byte(0xFF);
+    sd_cmd8_r1 = r8;
+    if (r8 == 0x01) {
+        for (int i = 0; i < 4; i++) sd_spi_byte(0xFF);  /* consume 4 echo bytes R7 */
+    } else {
+        for (int i = 0; i < 8; i++) sd_spi_byte(0xFF);  /* limpiar bus */
+    }
 
-    /* ACMD41: espera hasta salir de idle (máx 200 intentos) */
+    /* Gap post-CMD8 */
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
+    for (int i = 0; i < 1; i++) sd_spi_byte(0xFF);
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
+
+    /* ACMD41: espera hasta salir de idle.
+     * CS se toglea entre comandos: algunas tarjetas SDHC lo requieren.
+     * Máx 200 intentos × 10 ms = 2 s de timeout. */
     int tries = 0;
     do {
+        /* CMD55 — CS bajo, enviar, leer R1, CS alto + 8 clocks */
+        Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
         const u8 cmd55[] = {0x77, 0x00, 0x00, 0x00, 0x00, 0x01};
         for (int i = 0; i < 6; i++) sd_spi_byte(cmd55[i]);
         r1 = 0xFF;
         for (int i = 0; i < 10 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
+        sd_cmd55_r1 = r1;
+        Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
+        sd_spi_byte(0xFF);   /* 8 clocks con CS alto */
 
+        /* CMD41 — CS bajo, enviar, leer R1, CS alto + 8 clocks */
+        Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
         const u8 cmd41[] = {0x69, 0x40, 0x00, 0x00, 0x00, 0x01};
         for (int i = 0; i < 6; i++) sd_spi_byte(cmd41[i]);
         r1 = 0xFF;
         for (int i = 0; i < 10 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
+        Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
+        sd_spi_byte(0xFF);   /* 8 clocks con CS alto */
+
         tries++;
+        usleep(10000);   /* 10 ms por intento → 2 s de timeout total */
     } while (r1 != 0x00 && tries < 200);
+    sd_acmd41_r1  = r1;
+    sd_acmd41_try = tries;
 
     if (r1 != 0x00) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -2; }
+
+    /* Reaserta CS para CMD58 */
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
 
     /* CMD58: READ_OCR — detectar SDHC (bit CCS en OCR[30]) */
     const u8 cmd58[] = {0x7A, 0x00, 0x00, 0x00, 0x00, 0x01};
     for (int i = 0; i < 6; i++) sd_spi_byte(cmd58[i]);
     u8 r58 = 0xFF;
-    for (int i = 0; i < 10 && r58 == 0xFF; i++) r58 = sd_spi_byte(0xFF);
+    for (int i = 0; i < 20 && r58 == 0xFF; i++) r58 = sd_spi_byte(0xFF);
+    sd_cmd58_r1 = r58;
     u8 ocr0 = sd_spi_byte(0xFF);
+    sd_ocr0 = ocr0;
     sd_spi_byte(0xFF); sd_spi_byte(0xFF); sd_spi_byte(0xFF);  /* ocr[1..3] */
     sd_sdhc = (r58 == 0x00 && (ocr0 & 0x40)) ? 1 : 0;
 
@@ -351,6 +444,10 @@ static int sd_read_block(u32 lba, u8 *buf)
 {
     u32 addr = sd_sdhc ? lba : (lba << 9);
 
+    /* Gap mínimo SD SPI: 8+ ciclos idle con CS desasertado antes de cualquier cmd */
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
+    for (int i = 0; i < 2; i++) sd_spi_byte(0xFF);
+
     Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);   /* CS assert */
 
     u8 cmd[6] = { 0x51,
@@ -358,11 +455,13 @@ static int sd_read_block(u32 lba, u8 *buf)
     for (int i = 0; i < 6; i++) sd_spi_byte(cmd[i]);
 
     u8 r1 = 0xFF;
-    for (int i = 0; i < 10 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
+    for (int i = 0; i < 20 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
+    sd_read_r1 = r1;
     if (r1 != 0x00) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -1; }
 
     u8 tok = 0xFF;
     for (int i = 0; i < 500 && tok != 0xFE; i++) tok = sd_spi_byte(0xFF);
+    sd_read_token = tok;
     if (tok != 0xFE) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -1; }
 
     for (int i = 0; i < 512; i++) buf[i] = sd_spi_byte(0xFF);
@@ -385,7 +484,12 @@ static int sd_run_test(void)
 {
     xil_printf("\r\n=== SD TEST ===\r\n");
 
+    sd_spi_setup();
+    sd_loopback_ok = sd_loopback_test();
+    xil_printf("Loopback: %s\r\n", sd_loopback_ok ? "PASS" : "FAIL");
+
     int rc = sd_init();
+    sd_init_rc = rc;
     if (rc == -1) {
         xil_printf("FAIL CMD0: tarjeta no responde "
                    "(verificar SD_RESET=0, SCK llega al pin B1)\r\n");
@@ -398,6 +502,9 @@ static int sd_run_test(void)
     }
     xil_printf("PASS init: SD lista, tipo=%s\r\n",
                sd_sdhc ? "SDHC/SDXC" : "SDSC");
+
+    /* Pausa post-init: garantiza que la tarjeta esté lista antes del primer CMD17 */
+    usleep(10000);
 
     /* Leer sector 0 (MBR) */
     if (sd_read_block(0, sd_sector_buf) != 0) {
@@ -801,6 +908,8 @@ static void diag_stripes(void)
  * ═══════════════════════════════════════════════════════════════════════════ */
 int main(void)
 {
+    xil_printf("\r\n=== PONG BOOT ===\r\n");
+
     /* GPIO0: botones (ch1 in) + SW (ch2 in) */
     XGpio_Initialize(&gpio0, XPAR_AXI_GPIO_0_BASEADDR);
     XGpio_SetDataDirection(&gpio0, 1, 0x1Fu);
@@ -819,8 +928,11 @@ int main(void)
     XSpi_IntrGlobalDisable(&spi);
 
     /* DDR2: esperar calibración MIG, verificar R/W y cargar sprites por defecto */
+    xil_printf("INFO: DDR2 init...\r\n");
     ddr2_init();
+    xil_printf("INFO: DDR2 selftest...\r\n");
     ddr2_selftest();
+    xil_printf("INFO: DDR2 sprites...\r\n");
     ddr2_sprite_defaults();
 
     /* Estado inicial */
