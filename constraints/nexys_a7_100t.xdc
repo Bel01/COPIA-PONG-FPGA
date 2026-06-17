@@ -109,12 +109,13 @@ set_property -dict { PACKAGE_PIN G17 IOSTANDARD LVCMOS33 } [get_ports { SPI_CS_N
 ## -----------------------------------------------------------------------------
 ## microSD — conector integrado de la Nexys A7
 ## SPI mode: SCK=B1(sd_sck) MOSI=C1(sd_cmd) MISO=C2(sd_dat[0]) CS_N=D2(sd_dat[3])
-## SD_CD=A1 SD_RESET=E2 — no conectados al SPI IP
+## SD_RESET=E2: mantener en 0 para liberar la SD al usuario tras el arranque de la FPGA
 ## -----------------------------------------------------------------------------
 set_property -dict { PACKAGE_PIN B1  IOSTANDARD LVCMOS33 } [get_ports { SD_SCK }]
 set_property -dict { PACKAGE_PIN C1  IOSTANDARD LVCMOS33 } [get_ports { SD_MOSI }]
 set_property -dict { PACKAGE_PIN C2  IOSTANDARD LVCMOS33 } [get_ports { SD_MISO }]
 set_property -dict { PACKAGE_PIN D2  IOSTANDARD LVCMOS33 } [get_ports { SD_CS_N[0] }]
+set_property -dict { PACKAGE_PIN E2  IOSTANDARD LVCMOS33 } [get_ports { SD_RESET }]
 
 ## =============================================================================
 ## Excepciones de temporización — puertos sin requisito de tiempo externo
@@ -139,7 +140,7 @@ set_false_path -to [get_ports {LED[*]}]
 set_false_path -to [get_ports {VGA_R[*] VGA_G[*] VGA_B[*] VGA_HS VGA_VS}]
 set_false_path -to [get_ports {UART_TXD_IN}]
 set_false_path -to [get_ports {SPI_MOSI SPI_MISO SPI_CS_N[*]}]
-set_false_path -to [get_ports {SD_MOSI SD_SCK SD_CS_N[*]}]
+set_false_path -to [get_ports {SD_MOSI SD_SCK SD_CS_N[*] SD_RESET}]
 
 ## =============================================================================
 ## Waivers — artefactos conocidos del IP Clock Wizard en Block Design
