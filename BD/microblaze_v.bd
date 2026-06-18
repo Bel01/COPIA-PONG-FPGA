@@ -1,7 +1,7 @@
 {
   "design": {
     "design_info": {
-      "boundary_crc": "0x1912D9CA9F15EDDC",
+      "boundary_crc": "0xEE12E1FFD4FAB34D",
       "device": "xc7a100tcsg324-1",
       "gen_directory": "../../../../pong_project.gen/sources_1/bd/microblaze_v",
       "name": "microblaze_v",
@@ -197,7 +197,7 @@
           "TRI_I": {
             "physical_name": "gpio_rtl_0_tri_i",
             "direction": "I",
-            "left": "4",
+            "left": "5",
             "right": "0"
           }
         }
@@ -2104,7 +2104,7 @@
             "value": "1"
           },
           "C_GPIO_WIDTH": {
-            "value": "5"
+            "value": "6"
           },
           "C_IS_DUAL": {
             "value": "1"

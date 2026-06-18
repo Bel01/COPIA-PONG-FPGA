@@ -68,5 +68,13 @@ __pycache__/
 **.xdc.ucf
 xvlog.pb
 
+## Vitis / Lopper — temporales generados automáticamente
+.rigel_lopper_temp_platform/
+.wsdata/
+.lock
+
+## Xilinx — simulación
+xsim.dir/
+
 ## Claude Code
 .claude/settings.local.json

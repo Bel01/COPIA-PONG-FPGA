@@ -63,12 +63,19 @@ Si Vitis está en otra ruta, ajusta `settings64.sh` y el argumento de workspace.
 ### 1. Sintetizar hardware (solo si cambiaste HDL o BD)
 
 ```bash
-source /tools/Xilinx/Vivado/2024.1/settings64.sh
-vivado -mode batch -source scripts/build_bitstream.tcl \
-       -log logs/build_bitstream.log
+bash scripts/build_all.sh
 ```
 
-El bitstream queda en `bin/pong_project-v<TAG>/`.
+El script detecta Vivado automáticamente (PATH, rutas comunes, llaves USB montadas),
+crea el proyecto Vivado desde HoG si no existe, y lanza síntesis + implementación +
+bitstream. El resultado queda en `bin/build_latest/top_pong_project.bit`.
+
+Si Vivado no está en PATH, exporta la raíz de instalación primero:
+
+```bash
+export VIVADO_ROOT=/ruta/a/Vivado/2024.1
+bash scripts/build_all.sh
+```
 
 ### 2. Compilar firmware
 
