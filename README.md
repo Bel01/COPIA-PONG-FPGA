@@ -383,3 +383,28 @@ pip install Pillow
 # o en algunos sistemas:
 pip3 install Pillow
 ```
+
+---
+
+## Nota de uso de Inteligencia Artificial
+
+En el desarrollo de este proyecto se utilizó Claude (Anthropic) como herramienta de asistencia. El uso incluyó las siguientes áreas:
+
+- **Firmware (pong.c):** asistencia en la implementación del modo 2 jugadores vía SPI, depuración de la colisión de la paleta derecha, sincronización del marcador entre FPGAs y corrección de errores de timing en el protocolo SPI.
+- **Scripts de build y programación:** generación de `build_all.sh`, `build_vitis.sh`, `program_both.tcl` y `program_and_run.tcl`.
+- **Documentación:** estructura y contenido del README.
+- **Depuración general:** identificación de causas raíz en problemas de DDR2, SPI en modo esclavo y sincronización entre FPGAs.
+
+El diseño RTL (`src/hdl/`), el Block Design en Vivado, las constraints XDC y la arquitectura general del sistema fueron desarrollados por el equipo.
+
+**Ejemplos de interacción:**
+
+> **Prompt:** "Los LEDs del maestro están todos apagados, pero cuando toca la pelota sí se ve un patrón momentáneamente."
+>
+> **Respuesta (resumen):** Se identificó que el esclavo tenía `pad[1].y = 210` correcto (LEDs = `01101001`), pero el maestro recibía `remote_y = 0` porque el `SPICR_TXRST` en el reload del loop borraba los bytes del FIFO inmediatamente después de escribirlos, antes de que el AXI completara la propagación. Se eliminó el TXRST del loop y se confió en el ciclo natural 8-in/8-out del FIFO.
+
+---
+
+> **Prompt:** "Sigue sin rebotar..."
+>
+> **Respuesta (resumen):** Diagnóstico progresivo vía LEDs: se determinó que el AXI Quad SPI en modo esclavo solo transmite fiablemente el byte 0 del TX FIFO. La solución fue codificar `pad[1].y >> 1` (rango 0–210, cabe en `uint8`) en el byte 0, y reconstruir en el maestro con `rx[0] << 1`.
