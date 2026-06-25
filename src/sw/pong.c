@@ -465,6 +465,14 @@ static void fb_draw_str(int x, int y, const char *s, int scale, u8 color) {
  * que ya respeta paletas, marcador y scanlines). No hace fb_clear(), no toca
  * el resto de la pantalla.
  */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * draw_wave — reemplaza la versión anterior
+ *
+ * BUG 3 FIX: el anillo nuevo no se dibuja sobre la zona del marcador
+ * (y < 42). El borrado del rastro anterior sí usa bg_pixel, que ya
+ * devuelve COL_WHITE para los píxeles de dígito, así que el marcador
+ * se restaura correctamente al pasar la onda por encima.
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static void draw_wave(void)
 {
     if (!wave_active) return;
@@ -472,7 +480,7 @@ static void draw_wave(void)
     u8  color    = rainbow_colors[rainbow_index];
     int r        = wave_r;
     int thick    = WAVE_THICK;
-    int draw_new = (r <= WAVE_MAX_R);  /* si ya pasó el radio máximo, solo limpiar */
+    int draw_new = (r <= WAVE_MAX_R);
 
     int y_start = wave_y - r - thick;
     int y_end   = wave_y + r + thick;
@@ -483,7 +491,6 @@ static void draw_wave(void)
         int dy = py - wave_y;
         if (dy < 0) dy = -dy;
 
-        /* Borde exterior del rombo nuevo (solo si todavía dentro del radio máximo) */
         if (draw_new) {
             for (int t = 0; t < thick; t++) {
                 int ro = r + t;
@@ -491,13 +498,23 @@ static void draw_wave(void)
                 if (rx < 0) continue;
                 int px_l = wave_x - rx;
                 int px_r = wave_x + rx;
-                if (px_l >= 0 && px_l < FB_W) fb_set_pixel(px_l, py, color);
-                if (px_r >= 0 && px_r < FB_W && px_r != px_l)
-                    fb_set_pixel(px_r, py, color);
+
+                /*
+                 * BUG 3 FIX — no pintar encima del marcador (zona y < 42).
+                 * El borrado del rastro usa bg_pixel() que ya sabe
+                 * restaurar los dígitos, así que solo bloqueamos
+                 * el dibujo del anillo nuevo.
+                 */
+                if (py >= 42) {
+                    if (px_l >= 0 && px_l < FB_W)
+                        fb_set_pixel(px_l, py, color);
+                    if (px_r >= 0 && px_r < FB_W && px_r != px_l)
+                        fb_set_pixel(px_r, py, color);
+                }
             }
         }
 
-        /* Borrar rastro anterior (radio anterior = r - wave_speed) */
+        /* Borrar rastro anterior — sin cambios, bg_pixel ya maneja el marcador */
         int r_old = r - wave_speed;
         if (r_old > 0) {
             for (int t = 0; t < thick; t++) {
@@ -515,43 +532,90 @@ static void draw_wave(void)
     }
 
     wave_r += wave_speed;
-
-    /* Una vez que este frame ya solo borró (no dibujó), el anillo quedó
-     * completamente limpio: ahora sí se apaga sin dejar restos. */
     if (!draw_new) wave_active = 0;
 }
 
-/*
- * draw_hit_border: dibuja un borde blanco de HIT_BORDER_THICK px alrededor
- * de la paddle que golpeó la pelota, durante HIT_BORDER_FRAMES frames
- * (~0.5 s). Se redibuja en la posición ACTUAL de la paddle en cada frame,
- * así que sigue a la paddle aunque esta se mueva. Al expirar, restaura
- * la paddle completa a su color arcoíris (sin borde).
- */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * draw_hit_border — reemplaza la versión anterior
+ *
+ * BUG 2 FIX:
+ *   - El borde se dibuja en CADA frame mientras border_timer > 0,
+ *     independientemente de si la paddle se movió o no.
+ *   - Antes de dibujar el borde nuevo, se borra el borde del frame
+ *     anterior restaurando los píxeles correctos (interior arcoíris
+ *     o bg si la paddle se movió).
+ *   - Al expirar, se borra el borde y se deja la paddle limpia.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Posición del borde en el frame anterior — para poder borrarlo
+ * aunque la paddle se haya movido entre frames. */
+static int border_prev_py = -1;
+
 static void draw_hit_border(void)
 {
     if (border_timer <= 0 || border_pad < 0) return;
 
     int idx     = border_pad;
     int visible = (!mode_2p) || (idx == 0 ? !is_slave : is_slave);
-    if (!visible) { border_timer = 0; border_pad = -1; return; }
+    if (!visible) { border_timer = 0; border_pad = -1; border_prev_py = -1; return; }
 
-    int px = (idx == 0) ? PAD1_X : PAD2_X;
-    int py = pad[idx].y;
-    int t  = HIT_BORDER_THICK;
+    int px      = (idx == 0) ? PAD1_X : PAD2_X;
+    int py      = pad[idx].y;   /* posición ACTUAL de la paddle */
+    int t       = HIT_BORDER_THICK;
+    u8  pad_col = rainbow_colors[rainbow_index];
 
-    fb_fill_rect(px,             py,             PAD_W, t,     COL_WHITE); /* arriba */
-    fb_fill_rect(px,             py + PAD_H - t, PAD_W, t,     COL_WHITE); /* abajo  */
-    fb_fill_rect(px,             py,             t,     PAD_H, COL_WHITE); /* izq    */
-    fb_fill_rect(px + PAD_W - t, py,             t,     PAD_H, COL_WHITE); /* der    */
+    /*
+     * Paso 1 — borrar el borde del frame anterior si la paddle se movió.
+     * Si border_prev_py == py la paddle no se movió y el borde anterior
+     * está exactamente donde lo vamos a redibujar: no hace falta borrarlo.
+     */
+    if (border_prev_py >= 0 && border_prev_py != py) {
+        int opy = border_prev_py;
+        /* Restaurar las 4 tiras del borde viejo con el color correcto.
+         * Usamos bg_pixel para el fondo y pad_col para el interior
+         * de la paddle, si es que alguna tira cae dentro de la paddle
+         * actual (caso de solapamiento parcial al moverse). */
+        for (int row = opy; row < opy + PAD_H; row++) {
+            for (int col = px; col < px + PAD_W; col++) {
+                /* Solo las tiras que eran borde */
+                int en_borde = (row < opy + t) || (row >= opy + PAD_H - t) ||
+                               (col < px + t)  || (col >= px + PAD_W - t);
+                if (!en_borde) continue;
+                /* ¿Este píxel pertenece a la paddle en su posición NUEVA? */
+                int en_pad_nuevo = (row >= py && row < py + PAD_H);
+                if (en_pad_nuevo)
+                    fb_set_pixel(col, row, pad_col);
+                else
+                    fb_set_pixel(col, row, bg_pixel(col, row));
+            }
+        }
+    }
 
     border_timer--;
 
     if (border_timer == 0) {
-        /* Quitar el borde: repintar la paddle entera con su color arcoíris */
-        fb_fill_rect(px, py, PAD_W, PAD_H, rainbow_colors[rainbow_index]);
-        border_pad = -1;
+        /*
+         * Paso 2a — expiró: restaurar los 4 bordes en la posición actual
+         * con el color correcto (interior arcoíris).
+         */
+        fb_fill_rect(px,             py,             PAD_W, t,     pad_col);
+        fb_fill_rect(px,             py + PAD_H - t, PAD_W, t,     pad_col);
+        fb_fill_rect(px,             py,             t,     PAD_H, pad_col);
+        fb_fill_rect(px + PAD_W - t, py,             t,     PAD_H, pad_col);
+        border_pad    = -1;
+        border_prev_py = -1;
+        return;
     }
+
+    /*
+     * Paso 2b — todavía activo: dibujar el borde blanco en la posición actual.
+     */
+    fb_fill_rect(px,             py,             PAD_W, t,     COL_WHITE);
+    fb_fill_rect(px,             py + PAD_H - t, PAD_W, t,     COL_WHITE);
+    fb_fill_rect(px,             py,             t,     PAD_H, COL_WHITE);
+    fb_fill_rect(px + PAD_W - t, py,             t,     PAD_H, COL_WHITE);
+
+    border_prev_py = py;
 }
 
 /*
@@ -568,25 +632,39 @@ static void draw_scanlines(void)
     }
 }
 
-/*
- * on_paddle_hit: llamada UNA vez por colisión detecada en move_ball().
- * Actualiza rainbow_index, activa wave y el borde de golpe.
- * Parámetros: pad_idx = 0 (izq) o 1 (der); cx,cy = centro del pad golpeado
- * en coords de pantalla.
- */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * on_paddle_hit — reemplaza la versión anterior
+ * ═══════════════════════════════════════════════════════════════════════════ */
 static void on_paddle_hit(int pad_idx, int cx, int cy, int ball_spd)
 {
+    int old_index = rainbow_index;
+
     /* Avanzar color arcoíris */
     rainbow_index++;
     if (rainbow_index >= 7) rainbow_index = 0;
+
+    /*
+     * BUG 1 FIX — repintar ambas paddles visibles con el nuevo color
+     * inmediatamente, antes de que el delta-rect del frame actual
+     * solo pinte las franjas movidas con el color viejo.
+     * Solo se repinta la paddle visible en esta pantalla.
+     */
+    (void)old_index;  /* ya no necesitamos el color anterior */
+    u8 new_color = rainbow_colors[rainbow_index];
+
+    if (!mode_2p || !is_slave)
+        fb_fill_rect(PAD1_X, pad[0].y, PAD_W, PAD_H, new_color);
+    if (!mode_2p || is_slave)
+        fb_fill_rect(PAD2_X, pad[1].y, PAD_W, PAD_H, new_color);
 
     /* Activar onda rombo desde el centro del pad */
     wave_active = 1;
     wave_x      = cx;
     wave_y      = cy;
-    wave_r      = WAVE_THICK;            /* empieza con radio mínimo */
-    wave_speed  = 2 + ball_spd / 3;     /* 2-4 px/frame según velocidad */
-    if (wave_speed > 4) wave_speed = 4; /* tope para que quepa en pantalla */
+    wave_r      = WAVE_THICK;
+    wave_speed  = 2 + ball_spd / 3;
+    if (wave_speed > 4) wave_speed = 4;
 
     /* Activar borde de golpe en la paddle correspondiente */
     border_pad   = pad_idx;
