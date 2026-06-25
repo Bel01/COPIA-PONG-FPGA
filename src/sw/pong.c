@@ -201,10 +201,13 @@ static const u8 rainbow_colors[7] = {
     COL_MAGENTA  /* 9 */
 };
 
-/* Flash de impacto: contador de frames activo tras un golpe.
- * Se pinta una franja horizontal de 2px del color actual sobre los pads. */
-static int   flash_timer  = 0;   /* frames restantes del flash */
-#define FLASH_FRAMES  4          /* duración total del flash (4 frames ≈ 67 ms a 60 Hz) */
+/* Borde de golpe: paddle que fue golpeada muestra un borde blanco de
+ * HIT_BORDER_THICK px durante HIT_BORDER_FRAMES frames, siguiendo a la
+ * paddle si esta se mueve. border_pad = -1 significa "ningún borde activo". */
+static int   border_pad   = -1;
+static int   border_timer = 0;
+#define HIT_BORDER_FRAMES 30   /* ~0.5 s a 60 Hz */
+#define HIT_BORDER_THICK   2   /* grosor del borde en píxeles */
 
 /* Onda rombo: distancia Manhattan desde el punto de impacto, sin trigonometría.
  * Solo se dibuja el perímetro del rombo (borde de grosor WAVE_THICK px). */
@@ -214,6 +217,7 @@ static int   wave_y      = 0;
 static int   wave_r      = 0;   /* radio actual en píxeles Manhattan */
 static int   wave_speed  = 0;   /* expansión px/frame según velocidad de la bola */
 #define WAVE_THICK  2            /* grosor del borde del rombo en píxeles */
+#define WAVE_MAX_R  140          /* radio máximo: ondulación local, NO cubre toda la pantalla */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * RENDERER — escritura al framebuffer BRAM
@@ -297,6 +301,23 @@ static void fb_fill_rect(int x, int y, int w, int h, u8 color)
     }
 }
 
+/* Color de fondo "puro" para una fila dada, respetando la grilla de
+ * scanlines CRT (COL_DGRAY cada 4 filas en vez de COL_BLACK).
+ * Usado al borrar pelota/paletas para no agujerear las scanlines. */
+static u8 bg_row_color(int y)
+{
+    return ((y & 3) == 0) ? COL_DGRAY : COL_BLACK;
+}
+
+/* Igual que fb_fill_rect pero rellena cada fila con su color de fondo
+ * correcto (negro u oscuro de scanline) en vez de un color fijo. */
+static void fb_fill_rect_bg(int x, int y, int w, int h)
+{
+    int y1 = y, y2 = y + h;
+    for (int row = y1; row < y2; row++)
+        fb_fill_rect(x, row, w, 1, bg_row_color(row));
+}
+
 /* Font 4×5 para dígitos 0-9. */
 static const u8 font4x5[10][5] = {
     {0x6, 0x9, 0x9, 0x9, 0x6},  /* 0 */
@@ -343,6 +364,9 @@ static u8 bg_pixel(int x, int y)
         y >= pad[0].y && y < pad[0].y + PAD_H) return rainbow_colors[rainbow_index];
     if ((!mode_2p || is_slave) && x >= PAD2_X && x < PAD2_X + PAD_W &&
         y >= pad[1].y && y < pad[1].y + PAD_H) return rainbow_colors[rainbow_index];
+    /* Grilla CRT — cualquier restauración de fondo que no caiga sobre marcador
+     * o paletas debe respetar la scanline en vez de pintar negro puro. */
+    if ((y & 3) == 0) return COL_DGRAY;
     return COL_BLACK;
 }
 
@@ -431,13 +455,15 @@ static void fb_draw_str(int x, int y, const char *s, int scale, u8 color) {
  * draw_wave: dibuja el perímetro de un rombo (distancia Manhattan) expandiéndose
  * desde el punto de impacto. Sin trigonometría — solo abs() y sumas enteras.
  *
- * Estrategia dirty-rect: solo pinta el perímetro nuevo (WAVE_THICK px de grosor)
- * y borra el perímetro anterior pintando COL_BLACK sobre esos mismos píxeles.
- * No hace fb_clear(), no toca el resto de la pantalla.
+ * Es una ONDA LOCAL, no un efecto de pantalla completa: el radio está
+ * acotado a WAVE_MAX_R. Al llegar a ese radio, el frame siguiente solo
+ * borra el último anillo dibujado (sin dibujar uno nuevo) y se desactiva,
+ * garantizando que no quede un anillo "fantasma" pegado en pantalla.
  *
- * Costo por frame: O(perímetro) = O(4 * wave_r) píxeles, cada uno un fb_set_pixel
- * (RMW de 32 bits). A radio máximo ~300 px ≈ 1200 operaciones, vs 307 200 de un
- * fb_clear() — más de 256× más barato.
+ * Estrategia dirty-rect: solo pinta el perímetro nuevo (WAVE_THICK px de grosor)
+ * y borra el perímetro anterior restaurando el color de fondo real (bg_pixel,
+ * que ya respeta paletas, marcador y scanlines). No hace fb_clear(), no toca
+ * el resto de la pantalla.
  */
 static void draw_wave(void)
 {
@@ -446,10 +472,8 @@ static void draw_wave(void)
     u8  color    = rainbow_colors[rainbow_index];
     int r        = wave_r;
     int thick    = WAVE_THICK;
+    int draw_new = (r <= WAVE_MAX_R);  /* si ya pasó el radio máximo, solo limpiar */
 
-    /* Dibujar borde nuevo y borrar borde anterior en el mismo barrido.
-     * El rombo |x - cx| + |y - cy| = r se recorre fila por fila: para cada y,
-     * los dos x del borde son cx ± (r - |y - cy|). */
     int y_start = wave_y - r - thick;
     int y_end   = wave_y + r + thick;
     if (y_start < 0)     y_start = 0;
@@ -459,17 +483,18 @@ static void draw_wave(void)
         int dy = py - wave_y;
         if (dy < 0) dy = -dy;
 
-        /* Borde exterior del rombo nuevo */
-        for (int t = 0; t < thick; t++) {
-            int ro = r + t;
-            int rx = ro - dy;
-            if (rx < 0) continue;
-            /* dos puntos simétricos del borde */
-            int px_l = wave_x - rx;
-            int px_r = wave_x + rx;
-            if (px_l >= 0 && px_l < FB_W) fb_set_pixel(px_l, py, color);
-            if (px_r >= 0 && px_r < FB_W && px_r != px_l)
-                fb_set_pixel(px_r, py, color);
+        /* Borde exterior del rombo nuevo (solo si todavía dentro del radio máximo) */
+        if (draw_new) {
+            for (int t = 0; t < thick; t++) {
+                int ro = r + t;
+                int rx = ro - dy;
+                if (rx < 0) continue;
+                int px_l = wave_x - rx;
+                int px_r = wave_x + rx;
+                if (px_l >= 0 && px_l < FB_W) fb_set_pixel(px_l, py, color);
+                if (px_r >= 0 && px_r < FB_W && px_r != px_l)
+                    fb_set_pixel(px_r, py, color);
+            }
         }
 
         /* Borrar rastro anterior (radio anterior = r - wave_speed) */
@@ -481,7 +506,6 @@ static void draw_wave(void)
                 if (rx < 0) continue;
                 int px_l = wave_x - rx;
                 int px_r = wave_x + rx;
-                /* Restaurar con bg_pixel para no destruir pads/marcador */
                 if (px_l >= 0 && px_l < FB_W)
                     fb_set_pixel(px_l, py, bg_pixel(px_l, py));
                 if (px_r >= 0 && px_r < FB_W && px_r != px_l)
@@ -490,49 +514,43 @@ static void draw_wave(void)
         }
     }
 
-    /* Avanzar radio */
     wave_r += wave_speed;
 
-    /* Apagar cuando el rombo sale completamente de pantalla */
-    if (wave_r > FB_W + FB_H) wave_active = 0;
+    /* Una vez que este frame ya solo borró (no dibujó), el anillo quedó
+     * completamente limpio: ahora sí se apaga sin dejar restos. */
+    if (!draw_new) wave_active = 0;
 }
 
 /*
- * draw_flash: pinta dos franjas horizontales de 2px sobre cada pad visible,
- * del color arcoíris actual. Decrementa el timer y restaura el color del pad
- * (rainbow_colors[rainbow_index]) cuando expira, re-dibujando el pad normal.
- *
- * Costo por frame: 2 × fb_fill_rect de 8×2 px = 32 píxeles. Insignificante.
+ * draw_hit_border: dibuja un borde blanco de HIT_BORDER_THICK px alrededor
+ * de la paddle que golpeó la pelota, durante HIT_BORDER_FRAMES frames
+ * (~0.5 s). Se redibuja en la posición ACTUAL de la paddle en cada frame,
+ * así que sigue a la paddle aunque esta se mueva. Al expirar, restaura
+ * la paddle completa a su color arcoíris (sin borde).
  */
-static void draw_flash(void)
+static void draw_hit_border(void)
 {
-    if (flash_timer <= 0) return;
+    if (border_timer <= 0 || border_pad < 0) return;
 
-    u8 fc = rainbow_colors[rainbow_index];  /* mismo color que el pad */
+    int idx     = border_pad;
+    int visible = (!mode_2p) || (idx == 0 ? !is_slave : is_slave);
+    if (!visible) { border_timer = 0; border_pad = -1; return; }
 
-    /* Franja en el tercio superior e inferior del pad izquierdo */
-    if (!mode_2p || !is_slave) {
-        int py_top = pad[0].y + PAD_H / 4;
-        int py_bot = pad[0].y + PAD_H * 3 / 4;
-        fb_fill_rect(PAD1_X, py_top, PAD_W, 2, COL_WHITE);
-        fb_fill_rect(PAD1_X, py_bot, PAD_W, 2, COL_WHITE);
-    }
-    /* Franja pad derecho */
-    if (!mode_2p || is_slave) {
-        int py_top = pad[1].y + PAD_H / 4;
-        int py_bot = pad[1].y + PAD_H * 3 / 4;
-        fb_fill_rect(PAD2_X, py_top, PAD_W, 2, COL_WHITE);
-        fb_fill_rect(PAD2_X, py_bot, PAD_W, 2, COL_WHITE);
-    }
+    int px = (idx == 0) ? PAD1_X : PAD2_X;
+    int py = pad[idx].y;
+    int t  = HIT_BORDER_THICK;
 
-    flash_timer--;
+    fb_fill_rect(px,             py,             PAD_W, t,     COL_WHITE); /* arriba */
+    fb_fill_rect(px,             py + PAD_H - t, PAD_W, t,     COL_WHITE); /* abajo  */
+    fb_fill_rect(px,             py,             t,     PAD_H, COL_WHITE); /* izq    */
+    fb_fill_rect(px + PAD_W - t, py,             t,     PAD_H, COL_WHITE); /* der    */
 
-    /* Al expirar, restaurar el pad con su color arcoíris (sin franja blanca) */
-    if (flash_timer == 0) {
-        if (!mode_2p || !is_slave)
-            fb_fill_rect(PAD1_X, pad[0].y, PAD_W, PAD_H, fc);
-        if (!mode_2p || is_slave)
-            fb_fill_rect(PAD2_X, pad[1].y, PAD_W, PAD_H, fc);
+    border_timer--;
+
+    if (border_timer == 0) {
+        /* Quitar el borde: repintar la paddle entera con su color arcoíris */
+        fb_fill_rect(px, py, PAD_W, PAD_H, rainbow_colors[rainbow_index]);
+        border_pad = -1;
     }
 }
 
@@ -552,10 +570,11 @@ static void draw_scanlines(void)
 
 /*
  * on_paddle_hit: llamada UNA vez por colisión detecada en move_ball().
- * Actualiza rainbow_index, activa wave y flash.
- * Parámetros: cx,cy = centro del pad golpeado en coords de pantalla.
+ * Actualiza rainbow_index, activa wave y el borde de golpe.
+ * Parámetros: pad_idx = 0 (izq) o 1 (der); cx,cy = centro del pad golpeado
+ * en coords de pantalla.
  */
-static void on_paddle_hit(int cx, int cy, int ball_spd)
+static void on_paddle_hit(int pad_idx, int cx, int cy, int ball_spd)
 {
     /* Avanzar color arcoíris */
     rainbow_index++;
@@ -569,8 +588,9 @@ static void on_paddle_hit(int cx, int cy, int ball_spd)
     wave_speed  = 2 + ball_spd / 3;     /* 2-4 px/frame según velocidad */
     if (wave_speed > 4) wave_speed = 4; /* tope para que quepa en pantalla */
 
-    /* Activar flash */
-    flash_timer = FLASH_FRAMES;
+    /* Activar borde de golpe en la paddle correspondiente */
+    border_pad   = pad_idx;
+    border_timer = HIT_BORDER_FRAMES;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -867,8 +887,9 @@ static void init_game(void)
     needs_full_redraw = 1;
 
     /* Resetear efectos al iniciar partida */
-    wave_active = 0;
-    flash_timer = 0;
+    wave_active  = 0;
+    border_pad   = -1;
+    border_timer = 0;
 }
 
 static int collide(ball_t *b, int px, int py)
@@ -976,8 +997,8 @@ static void move_ball(void)
                   (hit < 46) ? -1 : (hit < 54) ? -2 : -2;
         if (ball.x < PAD1_X + PAD_W + 2) ball.x = PAD1_X + PAD_W + 2;
 
-        /* ── EFECTOS de impacto: pad izquierdo ── */
-        on_paddle_hit(PAD1_X + PAD_W / 2, pad[0].y + PAD_H / 2, spd);
+        /* ── EFECTOS de impacto: pad izquierdo (idx 0) ── */
+        on_paddle_hit(0, PAD1_X + PAD_W / 2, pad[0].y + PAD_H / 2, spd);
     }
 
     /* Colisión paleta derecha */
@@ -993,8 +1014,8 @@ static void move_ball(void)
                       (hit < 46) ? -1 : (hit < 54) ? -2 : -2;
             if (ball.x > rpad_x - BALL_SZ - 2) ball.x = rpad_x - BALL_SZ - 2;
 
-            /* ── EFECTOS de impacto: pad derecho (coord pantalla) ── */
-            on_paddle_hit(PAD2_X + PAD_W / 2, pad[1].y + PAD_H / 2, spd);
+            /* ── EFECTOS de impacto: pad derecho (idx 1, coord pantalla) ── */
+            on_paddle_hit(1, PAD2_X + PAD_W / 2, pad[1].y + PAD_H / 2, spd);
         }
     }
 }
@@ -1177,19 +1198,19 @@ static void render_frame(void)
                         int ovy = (old_by  + BALL_SZ > ball.y  && ball.y  + BALL_SZ > old_by);
                         if (!(ovx && ovy)) {
                             fb_fill_rect(new_bsx, ball.y,  BALL_SZ, BALL_SZ, COL_WHITE);
-                            fb_fill_rect(old_bsx, old_by, BALL_SZ, BALL_SZ, COL_BLACK);
+                            fb_fill_rect_bg(old_bsx, old_by, BALL_SZ, BALL_SZ);
                         } else {
                             fb_fill_rect(new_bsx, ball.y, BALL_SZ, BALL_SZ, COL_WHITE);
                             for (int r = 0; r < BALL_SZ; r++) {
                                 int py = old_by + r;
                                 if (py >= ball.y && py < ball.y + BALL_SZ) {
                                     if (new_bsx > old_bsx)
-                                        fb_fill_rect(old_bsx, py, new_bsx - old_bsx, 1, COL_BLACK);
+                                        fb_fill_rect(old_bsx, py, new_bsx - old_bsx, 1, bg_row_color(py));
                                     if (new_bsx + BALL_SZ < old_bsx + BALL_SZ)
                                         fb_fill_rect(new_bsx + BALL_SZ, py,
-                                                     (old_bsx + BALL_SZ) - (new_bsx + BALL_SZ), 1, COL_BLACK);
+                                                     (old_bsx + BALL_SZ) - (new_bsx + BALL_SZ), 1, bg_row_color(py));
                                 } else {
-                                    fb_fill_rect(old_bsx, py, BALL_SZ, 1, COL_BLACK);
+                                    fb_fill_rect(old_bsx, py, BALL_SZ, 1, bg_row_color(py));
                                 }
                             }
                         }
@@ -1210,7 +1231,7 @@ static void render_frame(void)
                             for (int d = 0; d < BALL_SZ; d++)
                                 fb_set_pixel(old_bsx+d, old_by+r, bg_pixel(old_bsx+d, old_by+r));
                     } else {
-                        fb_fill_rect(old_bsx, old_by, BALL_SZ, BALL_SZ, COL_BLACK);
+                        fb_fill_rect_bg(old_bsx, old_by, BALL_SZ, BALL_SZ);
                     }
                 } else {
                     fb_fill_rect(new_bsx, ball.y, BALL_SZ, BALL_SZ, COL_WHITE);
@@ -1218,18 +1239,25 @@ static void render_frame(void)
             }
         }
 
-        /* Delta-rect paddles con color arcoíris */
+        /* Delta-rect paddles con color arcoíris.
+         * Si esta paddle tiene el borde de golpe activo, se fuerza un
+         * repintado completo (no las franjas parciales optimizadas) para
+         * no dejar restos del borde blanco "atrapados" dentro del cuerpo
+         * de la paddle al moverse. */
         if ((!mode_2p || !is_slave) && pad[0].y != prev_pad0_y) {
             u8 pc = rainbow_colors[rainbow_index];
             int dy = pad[0].y - prev_pad0_y;
-            if (dy < 0 && -dy < PAD_H) {
+            if (border_pad == 0 && border_timer > 0) {
+                fb_fill_rect_bg(PAD1_X, prev_pad0_y, PAD_W, PAD_H);
+                fb_fill_rect(PAD1_X, pad[0].y, PAD_W, PAD_H, pc);
+            } else if (dy < 0 && -dy < PAD_H) {
                 fb_fill_rect(PAD1_X, pad[0].y,         PAD_W, -dy, pc);
-                fb_fill_rect(PAD1_X, pad[0].y + PAD_H, PAD_W, -dy, COL_BLACK);
+                fb_fill_rect_bg(PAD1_X, pad[0].y + PAD_H, PAD_W, -dy);
             } else if (dy > 0 && dy < PAD_H) {
-                fb_fill_rect(PAD1_X, prev_pad0_y,         PAD_W, dy, COL_BLACK);
+                fb_fill_rect_bg(PAD1_X, prev_pad0_y,         PAD_W, dy);
                 fb_fill_rect(PAD1_X, prev_pad0_y + PAD_H, PAD_W, dy, pc);
             } else {
-                fb_fill_rect(PAD1_X, prev_pad0_y, PAD_W, PAD_H, COL_BLACK);
+                fb_fill_rect_bg(PAD1_X, prev_pad0_y, PAD_W, PAD_H);
                 fb_fill_rect(PAD1_X, pad[0].y,    PAD_W, PAD_H, pc);
             }
             prev_pad0_y = pad[0].y;
@@ -1237,14 +1265,17 @@ static void render_frame(void)
         if ((!mode_2p || is_slave) && pad[1].y != prev_pad1_y) {
             u8 pc = rainbow_colors[rainbow_index];
             int dy = pad[1].y - prev_pad1_y;
-            if (dy < 0 && -dy < PAD_H) {
+            if (border_pad == 1 && border_timer > 0) {
+                fb_fill_rect_bg(PAD2_X, prev_pad1_y, PAD_W, PAD_H);
+                fb_fill_rect(PAD2_X, pad[1].y, PAD_W, PAD_H, pc);
+            } else if (dy < 0 && -dy < PAD_H) {
                 fb_fill_rect(PAD2_X, pad[1].y,         PAD_W, -dy, pc);
-                fb_fill_rect(PAD2_X, pad[1].y + PAD_H, PAD_W, -dy, COL_BLACK);
+                fb_fill_rect_bg(PAD2_X, pad[1].y + PAD_H, PAD_W, -dy);
             } else if (dy > 0 && dy < PAD_H) {
-                fb_fill_rect(PAD2_X, prev_pad1_y,         PAD_W, dy, COL_BLACK);
+                fb_fill_rect_bg(PAD2_X, prev_pad1_y,         PAD_W, dy);
                 fb_fill_rect(PAD2_X, prev_pad1_y + PAD_H, PAD_W, dy, pc);
             } else {
-                fb_fill_rect(PAD2_X, prev_pad1_y, PAD_W, PAD_H, COL_BLACK);
+                fb_fill_rect_bg(PAD2_X, prev_pad1_y, PAD_W, PAD_H);
                 fb_fill_rect(PAD2_X, pad[1].y,    PAD_W, PAD_H, pc);
             }
             prev_pad1_y = pad[1].y;
@@ -1252,11 +1283,11 @@ static void render_frame(void)
 
         prev_ball_x = ball.x; prev_ball_y = ball.y;
 
-        /* 3. ONDA ROMBO — se dibuja incremental, solo el perímetro */
+        /* 3. ONDA ROMBO — se dibuja incremental, solo el perímetro, radio acotado */
         draw_wave();
 
-        /* 2. FLASH DE IMPACTO */
-        draw_flash();
+        /* 2. BORDE DE GOLPE — sigue a la paddle golpeada durante ~0.5 s */
+        draw_hit_border();
 
         /* Overlay de pausa */
         if (!is_slave && game_state == ST_PAUSE && prev_selected != selected) {
