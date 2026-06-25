@@ -1325,10 +1325,10 @@ static void render_frame(void)
         if ((!mode_2p || !is_slave) && pad[0].y != prev_pad0_y) {
             u8 pc = rainbow_colors[rainbow_index];
             int dy = pad[0].y - prev_pad0_y;
-            if (border_pad == 0 && border_timer > 0) {
-                fb_fill_rect_bg(PAD1_X, prev_pad0_y, PAD_W, PAD_H);
-                fb_fill_rect(PAD1_X, pad[0].y, PAD_W, PAD_H, pc);
-            } else if (dy < 0 && -dy < PAD_H) {
+            /* BUG 1+2 FIX: ya no hay caso especial para border_pad.
+             * on_paddle_hit repintó la paddle entera al cambiar el color,
+             * y draw_hit_border gestiona el borde blanco frame a frame. */
+            if (dy < 0 && -dy < PAD_H) {
                 fb_fill_rect(PAD1_X, pad[0].y,         PAD_W, -dy, pc);
                 fb_fill_rect_bg(PAD1_X, pad[0].y + PAD_H, PAD_W, -dy);
             } else if (dy > 0 && dy < PAD_H) {
@@ -1336,17 +1336,14 @@ static void render_frame(void)
                 fb_fill_rect(PAD1_X, prev_pad0_y + PAD_H, PAD_W, dy, pc);
             } else {
                 fb_fill_rect_bg(PAD1_X, prev_pad0_y, PAD_W, PAD_H);
-                fb_fill_rect(PAD1_X, pad[0].y,    PAD_W, PAD_H, pc);
+                fb_fill_rect(PAD1_X, pad[0].y,       PAD_W, PAD_H, pc);
             }
             prev_pad0_y = pad[0].y;
         }
         if ((!mode_2p || is_slave) && pad[1].y != prev_pad1_y) {
             u8 pc = rainbow_colors[rainbow_index];
             int dy = pad[1].y - prev_pad1_y;
-            if (border_pad == 1 && border_timer > 0) {
-                fb_fill_rect_bg(PAD2_X, prev_pad1_y, PAD_W, PAD_H);
-                fb_fill_rect(PAD2_X, pad[1].y, PAD_W, PAD_H, pc);
-            } else if (dy < 0 && -dy < PAD_H) {
+            if (dy < 0 && -dy < PAD_H) {
                 fb_fill_rect(PAD2_X, pad[1].y,         PAD_W, -dy, pc);
                 fb_fill_rect_bg(PAD2_X, pad[1].y + PAD_H, PAD_W, -dy);
             } else if (dy > 0 && dy < PAD_H) {
@@ -1354,7 +1351,7 @@ static void render_frame(void)
                 fb_fill_rect(PAD2_X, prev_pad1_y + PAD_H, PAD_W, dy, pc);
             } else {
                 fb_fill_rect_bg(PAD2_X, prev_pad1_y, PAD_W, PAD_H);
-                fb_fill_rect(PAD2_X, pad[1].y,    PAD_W, PAD_H, pc);
+                fb_fill_rect(PAD2_X, pad[1].y,       PAD_W, PAD_H, pc);
             }
             prev_pad1_y = pad[1].y;
         }
