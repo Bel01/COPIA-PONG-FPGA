@@ -182,6 +182,40 @@ static XGpio   gpio1;
 static XSpi    spi;
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * EFECTOS VISUALES — estado
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Índice arcoíris: avanza en cada golpe de la pelota con un pad.
+ * Usa los colores de paleta disponibles en orden visual. */
+static int rainbow_index = 0;
+
+/* Tabla de colores arcoíris usando los índices de paleta existentes.
+ * 7 entradas ciclando: rojo, naranja, amarillo, verde, cyan(gris), azul, magenta */
+static const u8 rainbow_colors[7] = {
+    COL_RED,     /* 2 */
+    COL_ORANGE,  /* 6 */
+    COL_YELLOW,  /* 4 */
+    COL_GREEN,   /* 5 */
+    COL_GRAY,    /* 7 — más claro que cyan pero disponible */
+    COL_BLUE,    /* 3 */
+    COL_MAGENTA  /* 9 */
+};
+
+/* Flash de impacto: contador de frames activo tras un golpe.
+ * Se pinta una franja horizontal de 2px del color actual sobre los pads. */
+static int   flash_timer  = 0;   /* frames restantes del flash */
+#define FLASH_FRAMES  4          /* duración total del flash (4 frames ≈ 67 ms a 60 Hz) */
+
+/* Onda rombo: distancia Manhattan desde el punto de impacto, sin trigonometría.
+ * Solo se dibuja el perímetro del rombo (borde de grosor WAVE_THICK px). */
+static int   wave_active = 0;
+static int   wave_x      = 0;
+static int   wave_y      = 0;
+static int   wave_r      = 0;   /* radio actual en píxeles Manhattan */
+static int   wave_speed  = 0;   /* expansión px/frame según velocidad de la bola */
+#define WAVE_THICK  2            /* grosor del borde del rombo en píxeles */
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * RENDERER — escritura al framebuffer BRAM
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -194,24 +228,18 @@ static void fb_clear(u8 color)
         Xil_Out32(FB_BASE + (i << 2), p);
 }
 
-/* Espera flanco de subida del vsync. Si el bit no está disponible (GPIO <6 bits) regresa
-   inmediatamente para no bloquear el loop. */
+/* Espera flanco de subida del vsync. */
 static void wait_vsync(void)
 {
     int t;
-    /* Si ya estamos DENTRO del pulso (vsync LOW): esperar a que termine.
-     * Nota: el guard anterior hacía return inmediato aquí, lo que permitía
-     * 2-3 iteraciones de game logic por frame visual → efecto de pintado. */
     if (!(Xil_In32(XPAR_AXI_GPIO_0_BASEADDR) & BTN_VSYNC)) {
         t = 200000;
         while (!(Xil_In32(XPAR_AXI_GPIO_0_BASEADDR) & BTN_VSYNC) && --t);
-        return;  /* back porch comenzó — safe para renderizar */
+        return;
     }
-    /* Esperar LOW (inicio del pulso vsync) */
     t = 2000000;
     while ((Xil_In32(XPAR_AXI_GPIO_0_BASEADDR) & BTN_VSYNC) && --t);
     if (!t) return;
-    /* Esperar HIGH (fin del pulso = inicio del back porch) */
     t = 200000;
     while (!(Xil_In32(XPAR_AXI_GPIO_0_BASEADDR) & BTN_VSYNC) && --t);
 }
@@ -224,19 +252,18 @@ static u32 rng_next(void)
     return rng_state;
 }
 
-/* Dibuja un rectángulo relleno.  Usa read-modify-write solo en nibbles parciales. */
+/* Dibuja un rectángulo relleno. */
 static void fb_fill_rect(int x, int y, int w, int h, u8 color)
 {
     u8  c     = color & 0xF;
-    int x1    = (x < 0)    ? 0   : x;
+    int x1    = (x < 0)      ? 0    : x;
     int x2    = (x+w > FB_W) ? FB_W : x+w;
-    int y1    = (y < 0)    ? 0   : y;
+    int y1    = (y < 0)      ? 0    : y;
     int y2    = (y+h > FB_H) ? FB_H : y+h;
 
     for (int row = y1; row < y2; row++) {
         int col = x1;
 
-        /* Nibbles iniciales hasta alineación a 8 px */
         while (col < x2 && (col & 7)) {
             u32 pidx  = (u32)row * FB_W + col;
             u32 widx  = pidx >> 3;
@@ -249,7 +276,6 @@ static void fb_fill_rect(int x, int y, int w, int h, u8 color)
             col++;
         }
 
-        /* Palabras completas (8 píxeles alineados) — solo escritura */
         u32 pattern = (u32)c * 0x11111111u;
         while (col + 8 <= x2) {
             u32 pidx = (u32)row * FB_W + col;
@@ -257,7 +283,6 @@ static void fb_fill_rect(int x, int y, int w, int h, u8 color)
             col += 8;
         }
 
-        /* Nibbles finales */
         while (col < x2) {
             u32 pidx  = (u32)row * FB_W + col;
             u32 widx  = pidx >> 3;
@@ -272,7 +297,7 @@ static void fb_fill_rect(int x, int y, int w, int h, u8 color)
     }
 }
 
-/* Font 4×5 para dígitos 0-9.  bit 3 = columna izquierda, bit 0 = columna derecha. */
+/* Font 4×5 para dígitos 0-9. */
 static const u8 font4x5[10][5] = {
     {0x6, 0x9, 0x9, 0x9, 0x6},  /* 0 */
     {0x2, 0x6, 0x2, 0x2, 0x7},  /* 1 */
@@ -286,10 +311,6 @@ static const u8 font4x5[10][5] = {
     {0x6, 0x9, 0x7, 0x1, 0x6},  /* 9 */
 };
 
-/*
- * Dibuja un dígito en (x,y) con factor de escala `scale` (px por celda).
- * Resultado: (4×scale) × (5×scale) píxeles.
- */
 static void fb_draw_digit(int x, int y, int digit, int scale, u8 color)
 {
     const u8 *g = font4x5[digit % 10];
@@ -301,40 +322,30 @@ static void fb_draw_digit(int x, int y, int digit, int scale, u8 color)
     }
 }
 
-/* Dibuja el marcador centrado arriba: dos dígitos a cada lado de la red */
 static void fb_draw_scores(void)
 {
-    /* Dígitos de 6×6 px/celda → 24×30 px por dígito */
     fb_draw_digit(256, 8, score[0], 6, COL_WHITE);
     fb_draw_digit(360, 8, score[1], 6, COL_WHITE);
 }
 
-/* Devuelve el color de fondo estático en (x,y).
-   Conoce la línea central y los dígitos del marcador para poder
-   restaurar el fondo exacto al borrar la pelota sin redibujarlo. */
 static u8 bg_pixel(int x, int y)
 {
-    /* Línea central: 4px gris / 4px negro alternados en bloques de 8 */
     if (!mode_2p && x >= 318 && x < 322 && (y & 7) < 4) return COL_GRAY;
-    /* Dígito izquierdo (256,8) escala 6 → celdas de 6×6 px */
     if (x >= 256 && x < 280 && y >= 8 && y < 38) {
         u8 p = font4x5[score[0] % 10][(y - 8) / 6];
         if (p & (0x8u >> ((x - 256) / 6))) return COL_WHITE;
     }
-    /* Dígito derecho (360,8) escala 6 */
     if (x >= 360 && x < 384 && y >= 8 && y < 38) {
         u8 p = font4x5[score[1] % 10][(y - 8) / 6];
         if (p & (0x8u >> ((x - 360) / 6))) return COL_WHITE;
     }
-    /* Paletas visibles en esta pantalla */
     if ((!mode_2p || !is_slave) && x >= PAD1_X && x < PAD1_X + PAD_W &&
-        y >= pad[0].y && y < pad[0].y + PAD_H) return COL_WHITE;
+        y >= pad[0].y && y < pad[0].y + PAD_H) return rainbow_colors[rainbow_index];
     if ((!mode_2p || is_slave) && x >= PAD2_X && x < PAD2_X + PAD_W &&
-        y >= pad[1].y && y < pad[1].y + PAD_H) return COL_WHITE;
+        y >= pad[1].y && y < pad[1].y + PAD_H) return rainbow_colors[rainbow_index];
     return COL_BLACK;
 }
 
-/* Escribe un solo píxel con RMW (para restauración de fondo). */
 static void fb_set_pixel(int x, int y, u8 color)
 {
     u32 pidx  = (u32)y * FB_W + x;
@@ -344,13 +355,6 @@ static void fb_set_pixel(int x, int y, u8 color)
     Xil_Out32(addr, (word & ~(0xFu << shift)) | ((u32)color << shift));
 }
 
-/*
- * Blit de sprite 4-bit (high nibble = px izquierdo) al framebuffer.
- * Si transparent != 0, los píxeles con valor 0 (negro) no se escriben.
- */
-/* Blit con escala entera (sc=1 → 1:1, sc=4 → cada px del sprite = 4×4 en FB).
- * Agrupa runs consecutivos del mismo color en un solo fb_fill_rect para reducir
- * operaciones RMW en BRAM de O(w*h) a O(runs), crítico sin data cache. */
 static void fb_blit_scaled(int x, int y, int w, int h, const u8 *spr, int transparent, int sc)
 {
     for (int row = 0; row < h; row++) {
@@ -372,7 +376,6 @@ static void fb_blit_scaled(int x, int y, int w, int h, const u8 *spr, int transp
     }
 }
 
-/* Mini-fuente de letras: A,D,E,G,I,L,N,R,S,T,U (4×5 px, nibble MSB = col izquierdo) */
 static const u8 font_ext[16][5] = {
     {0x6, 0x9, 0xF, 0x9, 0x9},  /* A */
     {0xE, 0x9, 0x9, 0x9, 0xE},  /* D */
@@ -421,6 +424,156 @@ static void fb_draw_str(int x, int y, const char *s, int scale, u8 color) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * EFECTOS VISUALES — funciones de dibujo
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/*
+ * draw_wave: dibuja el perímetro de un rombo (distancia Manhattan) expandiéndose
+ * desde el punto de impacto. Sin trigonometría — solo abs() y sumas enteras.
+ *
+ * Estrategia dirty-rect: solo pinta el perímetro nuevo (WAVE_THICK px de grosor)
+ * y borra el perímetro anterior pintando COL_BLACK sobre esos mismos píxeles.
+ * No hace fb_clear(), no toca el resto de la pantalla.
+ *
+ * Costo por frame: O(perímetro) = O(4 * wave_r) píxeles, cada uno un fb_set_pixel
+ * (RMW de 32 bits). A radio máximo ~300 px ≈ 1200 operaciones, vs 307 200 de un
+ * fb_clear() — más de 256× más barato.
+ */
+static void draw_wave(void)
+{
+    if (!wave_active) return;
+
+    u8  color    = rainbow_colors[rainbow_index];
+    int r        = wave_r;
+    int thick    = WAVE_THICK;
+
+    /* Dibujar borde nuevo y borrar borde anterior en el mismo barrido.
+     * El rombo |x - cx| + |y - cy| = r se recorre fila por fila: para cada y,
+     * los dos x del borde son cx ± (r - |y - cy|). */
+    int y_start = wave_y - r - thick;
+    int y_end   = wave_y + r + thick;
+    if (y_start < 0)     y_start = 0;
+    if (y_end   >= FB_H) y_end   = FB_H - 1;
+
+    for (int py = y_start; py <= y_end; py++) {
+        int dy = py - wave_y;
+        if (dy < 0) dy = -dy;
+
+        /* Borde exterior del rombo nuevo */
+        for (int t = 0; t < thick; t++) {
+            int ro = r + t;
+            int rx = ro - dy;
+            if (rx < 0) continue;
+            /* dos puntos simétricos del borde */
+            int px_l = wave_x - rx;
+            int px_r = wave_x + rx;
+            if (px_l >= 0 && px_l < FB_W) fb_set_pixel(px_l, py, color);
+            if (px_r >= 0 && px_r < FB_W && px_r != px_l)
+                fb_set_pixel(px_r, py, color);
+        }
+
+        /* Borrar rastro anterior (radio anterior = r - wave_speed) */
+        int r_old = r - wave_speed;
+        if (r_old > 0) {
+            for (int t = 0; t < thick; t++) {
+                int ro = r_old + t;
+                int rx = ro - dy;
+                if (rx < 0) continue;
+                int px_l = wave_x - rx;
+                int px_r = wave_x + rx;
+                /* Restaurar con bg_pixel para no destruir pads/marcador */
+                if (px_l >= 0 && px_l < FB_W)
+                    fb_set_pixel(px_l, py, bg_pixel(px_l, py));
+                if (px_r >= 0 && px_r < FB_W && px_r != px_l)
+                    fb_set_pixel(px_r, py, bg_pixel(px_r, py));
+            }
+        }
+    }
+
+    /* Avanzar radio */
+    wave_r += wave_speed;
+
+    /* Apagar cuando el rombo sale completamente de pantalla */
+    if (wave_r > FB_W + FB_H) wave_active = 0;
+}
+
+/*
+ * draw_flash: pinta dos franjas horizontales de 2px sobre cada pad visible,
+ * del color arcoíris actual. Decrementa el timer y restaura el color del pad
+ * (rainbow_colors[rainbow_index]) cuando expira, re-dibujando el pad normal.
+ *
+ * Costo por frame: 2 × fb_fill_rect de 8×2 px = 32 píxeles. Insignificante.
+ */
+static void draw_flash(void)
+{
+    if (flash_timer <= 0) return;
+
+    u8 fc = rainbow_colors[rainbow_index];  /* mismo color que el pad */
+
+    /* Franja en el tercio superior e inferior del pad izquierdo */
+    if (!mode_2p || !is_slave) {
+        int py_top = pad[0].y + PAD_H / 4;
+        int py_bot = pad[0].y + PAD_H * 3 / 4;
+        fb_fill_rect(PAD1_X, py_top, PAD_W, 2, COL_WHITE);
+        fb_fill_rect(PAD1_X, py_bot, PAD_W, 2, COL_WHITE);
+    }
+    /* Franja pad derecho */
+    if (!mode_2p || is_slave) {
+        int py_top = pad[1].y + PAD_H / 4;
+        int py_bot = pad[1].y + PAD_H * 3 / 4;
+        fb_fill_rect(PAD2_X, py_top, PAD_W, 2, COL_WHITE);
+        fb_fill_rect(PAD2_X, py_bot, PAD_W, 2, COL_WHITE);
+    }
+
+    flash_timer--;
+
+    /* Al expirar, restaurar el pad con su color arcoíris (sin franja blanca) */
+    if (flash_timer == 0) {
+        if (!mode_2p || !is_slave)
+            fb_fill_rect(PAD1_X, pad[0].y, PAD_W, PAD_H, fc);
+        if (!mode_2p || is_slave)
+            fb_fill_rect(PAD2_X, pad[1].y, PAD_W, PAD_H, fc);
+    }
+}
+
+/*
+ * draw_scanlines: dibuja líneas horizontales oscuras (COL_DGRAY) cada 4 filas,
+ * altura 1px. Solo se llama en needs_full_redraw para no sobrecargar cada frame.
+ * Costo: 120 fb_fill_rect de 640×1 px = 120 × 80 palabras = 9600 escrituras BRAM.
+ * Coste único — no se repite por frame.
+ */
+static void draw_scanlines(void)
+{
+    for (int y = 0; y < FB_H; y += 4) {
+        /* Pintar 1px cada 4 filas con DGRAY encima del fondo negro */
+        fb_fill_rect(0, y, FB_W, 1, COL_DGRAY);
+    }
+}
+
+/*
+ * on_paddle_hit: llamada UNA vez por colisión detecada en move_ball().
+ * Actualiza rainbow_index, activa wave y flash.
+ * Parámetros: cx,cy = centro del pad golpeado en coords de pantalla.
+ */
+static void on_paddle_hit(int cx, int cy, int ball_spd)
+{
+    /* Avanzar color arcoíris */
+    rainbow_index++;
+    if (rainbow_index >= 7) rainbow_index = 0;
+
+    /* Activar onda rombo desde el centro del pad */
+    wave_active = 1;
+    wave_x      = cx;
+    wave_y      = cy;
+    wave_r      = WAVE_THICK;            /* empieza con radio mínimo */
+    wave_speed  = 2 + ball_spd / 3;     /* 2-4 px/frame según velocidad */
+    if (wave_speed > 4) wave_speed = 4; /* tope para que quepa en pantalla */
+
+    /* Activar flash */
+    flash_timer = FLASH_FRAMES;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * SD CARD — driver mínimo SPI manual (modo SPI 0, CPOL=0 CPHA=0)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -429,68 +582,51 @@ static void fb_draw_str(int x, int y, const char *s, int scale, u8 color) {
 
 static void sd_spi_setup(void)
 {
-    /* Software reset AXI Quad SPI (SRR offset correcto: 0x40) */
     Xil_Out32(SD_BASE + SPI_SRR, 0x0Au);
     usleep(100);
-    /* Resetear TX y RX FIFOs via bits CR[5:6] */
     Xil_Out32(SD_BASE + SPI_CR,
               SPICR_INHIBIT | SPICR_MANSS | SPICR_MASTER | SPICR_SPE |
               SPICR_TXRST | SPICR_RXRST);
     usleep(10);
-    /* Modo normal: master, manual SS, transfer inhibited, SPE */
     Xil_Out32(SD_BASE + SPI_CR, SPICR_INHIBIT | SPICR_MANSS | SPICR_MASTER | SPICR_SPE);
-    Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);   /* CS desasertado */
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
 }
 
 static u8 sd_spi_byte(u8 tx)
 {
-    /* Drenar RX FIFO de datos obsoletos antes de iniciar nueva transferencia */
     while (!(Xil_In32(SD_BASE + SPI_SR) & SPISR_RX_EMPTY))
         (void)Xil_In32(SD_BASE + SPI_DRR);
 
     u32 cr = Xil_In32(SD_BASE + SPI_CR);
     Xil_Out32(SD_BASE + SPI_DTR, tx);
-    Xil_Out32(SD_BASE + SPI_CR, cr & ~SPICR_INHIBIT);  /* iniciar transferencia */
+    Xil_Out32(SD_BASE + SPI_CR, cr & ~SPICR_INHIBIT);
 
-    /* Esperar TX vacío Y RX con dato: garantiza que el shift register terminó */
     for (int t = 0; t < 100000; t++) {
         u32 sr = Xil_In32(SD_BASE + SPI_SR);
         if ((sr & SPISR_TX_EMPTY) && !(sr & SPISR_RX_EMPTY)) break;
     }
-    Xil_Out32(SD_BASE + SPI_CR, cr);  /* detener transferencia (INHIBIT) */
+    Xil_Out32(SD_BASE + SPI_CR, cr);
     return (u8)Xil_In32(SD_BASE + SPI_DRR);
 }
 
-/* Verifica que el IP AXI Quad SPI funcione enviando 0x5A en loopback.
- * Retorna 1 si el byte enviado = byte recibido, 0 si hay error. */
 static int sd_loopback_test(void)
 {
     u32 cr = Xil_In32(SD_BASE + SPI_CR);
-    Xil_Out32(SD_BASE + SPI_CR, cr | SPICR_LOOP);   /* activar loopback */
+    Xil_Out32(SD_BASE + SPI_CR, cr | SPICR_LOOP);
     u8 echo = sd_spi_byte(0x5A);
-    Xil_Out32(SD_BASE + SPI_CR, cr);                  /* desactivar loopback */
+    Xil_Out32(SD_BASE + SPI_CR, cr);
     return (echo == 0x5A) ? 1 : 0;
 }
 
-/*
- * Inicializa la SD en modo SPI.
- * Retorna  0: OK
- *         -1: CMD0 sin respuesta (tarjeta no detectada o SCK no llega)
- *         -2: ACMD41 timeout (tarjeta no sale de idle — posible SD dañada)
- */
 static int sd_init(void)
 {
     sd_spi_setup();
 
-    /* 80 pulsos de clock con CS desasertado */
     Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
     for (int i = 0; i < 10; i++) sd_spi_byte(0xFF);
 
-    /* Aserta CS[0] — CMD0 en SPI mode requiere CS bajo ANTES del primer bit */
     Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
 
-    /* CMD0: GO_IDLE_STATE — espera R1=0x01
-     * Reintentar hasta 10 veces (con gap inter-cmd) en caso de mala sincronización. */
     const u8 cmd0[] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x95};
     u8 r1 = 0xFF;
     for (int attempt = 0; attempt < 20 && r1 != 0x01; attempt++) {
@@ -498,7 +634,6 @@ static int sd_init(void)
         r1 = 0xFF;
         for (int i = 0; i < 10 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
         if (r1 != 0x01) {
-            /* Gap inter-comando: desaserta CS, 8 clocks, reaserta */
             Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
             for (int i = 0; i < 1; i++) sd_spi_byte(0xFF);
             Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
@@ -508,37 +643,27 @@ static int sd_init(void)
     sd_cmd0_r1 = r1;
     if (r1 != 0x01) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -1; }
 
-    /* Gap post-CMD0: desaserta CS + 8 clocks + reaserta */
     Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
     for (int i = 0; i < 1; i++) sd_spi_byte(0xFF);
     Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
 
-    /* CMD8: SEND_IF_COND (SDHC check)
-     * R1=0x01 → SDHC (consume 4 echo bytes R7)
-     * R1=0x05 → SDSC legacy (no echo)
-     * R1=0xFF → no responde (tarjeta antigua o sin soporte) */
     const u8 cmd8[] = {0x48, 0x00, 0x00, 0x01, 0xAA, 0x87};
     for (int i = 0; i < 6; i++) sd_spi_byte(cmd8[i]);
     u8 r8 = 0xFF;
     for (int i = 0; i < 8 && r8 == 0xFF; i++) r8 = sd_spi_byte(0xFF);
     sd_cmd8_r1 = r8;
     if (r8 == 0x01) {
-        for (int i = 0; i < 4; i++) sd_spi_byte(0xFF);  /* consume 4 echo bytes R7 */
+        for (int i = 0; i < 4; i++) sd_spi_byte(0xFF);
     } else {
-        for (int i = 0; i < 8; i++) sd_spi_byte(0xFF);  /* limpiar bus */
+        for (int i = 0; i < 8; i++) sd_spi_byte(0xFF);
     }
 
-    /* Gap post-CMD8 */
     Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
     for (int i = 0; i < 1; i++) sd_spi_byte(0xFF);
     Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
 
-    /* ACMD41: espera hasta salir de idle.
-     * CS se toglea entre comandos: algunas tarjetas SDHC lo requieren.
-     * Máx 200 intentos × 10 ms = 2 s de timeout. */
     int tries = 0;
     do {
-        /* CMD55 — CS bajo, enviar, leer R1, CS alto + 8 clocks */
         Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
         const u8 cmd55[] = {0x77, 0x00, 0x00, 0x00, 0x00, 0x01};
         for (int i = 0; i < 6; i++) sd_spi_byte(cmd55[i]);
@@ -546,29 +671,26 @@ static int sd_init(void)
         for (int i = 0; i < 10 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
         sd_cmd55_r1 = r1;
         Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
-        sd_spi_byte(0xFF);   /* 8 clocks con CS alto */
+        sd_spi_byte(0xFF);
 
-        /* CMD41 — CS bajo, enviar, leer R1, CS alto + 8 clocks */
         Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
         const u8 cmd41[] = {0x69, 0x40, 0x00, 0x00, 0x00, 0x01};
         for (int i = 0; i < 6; i++) sd_spi_byte(cmd41[i]);
         r1 = 0xFF;
         for (int i = 0; i < 10 && r1 == 0xFF; i++) r1 = sd_spi_byte(0xFF);
         Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
-        sd_spi_byte(0xFF);   /* 8 clocks con CS alto */
+        sd_spi_byte(0xFF);
 
         tries++;
-        usleep(10000);   /* 10 ms por intento → 2 s de timeout total */
+        usleep(10000);
     } while (r1 != 0x00 && tries < 200);
     sd_acmd41_r1  = r1;
     sd_acmd41_try = tries;
 
     if (r1 != 0x00) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -2; }
 
-    /* Reaserta CS para CMD58 */
     Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
 
-    /* CMD58: READ_OCR — detectar SDHC (bit CCS en OCR[30]) */
     const u8 cmd58[] = {0x7A, 0x00, 0x00, 0x00, 0x00, 0x01};
     for (int i = 0; i < 6; i++) sd_spi_byte(cmd58[i]);
     u8 r58 = 0xFF;
@@ -576,26 +698,21 @@ static int sd_init(void)
     sd_cmd58_r1 = r58;
     u8 ocr0 = sd_spi_byte(0xFF);
     sd_ocr0 = ocr0;
-    sd_spi_byte(0xFF); sd_spi_byte(0xFF); sd_spi_byte(0xFF);  /* ocr[1..3] */
+    sd_spi_byte(0xFF); sd_spi_byte(0xFF); sd_spi_byte(0xFF);
     sd_sdhc = (r58 == 0x00 && (ocr0 & 0x40)) ? 1 : 0;
 
     Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
     return 0;
 }
 
-/*
- * Lee un bloque de 512 bytes desde el sector LBA.
- * SDHC: dirección por bloques.  SDSC: dirección por bytes (lba << 9).
- */
 static int sd_read_block(u32 lba, u8 *buf)
 {
     u32 addr = sd_sdhc ? lba : (lba << 9);
 
-    /* Gap: 8 ciclos idle con CS desasertado */
     Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
     for (int i = 0; i < 8; i++) sd_spi_byte(0xFF);
 
-    Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);   /* CS assert */
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFEu);
 
     u8 cmd[6] = { 0x51,
         (u8)(addr >> 24), (u8)(addr >> 16), (u8)(addr >> 8), (u8)addr, 0x01 };
@@ -606,28 +723,18 @@ static int sd_read_block(u32 lba, u8 *buf)
     sd_read_r1 = r1;
     if (r1 != 0x00) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -1; }
 
-    /* N_AC_max = 100 ms @ 3.125 MHz = ~31250 bytes; usar 40000 con margen */
     u8 tok = 0xFF;
     for (int i = 0; i < 40000 && tok != 0xFE; i++) tok = sd_spi_byte(0xFF);
     sd_read_token = tok;
     if (tok != 0xFE) { Xil_Out32(SD_BASE + SPI_SSR, 0xFFu); return -1; }
 
     for (int i = 0; i < 512; i++) buf[i] = sd_spi_byte(0xFF);
-    sd_spi_byte(0xFF); sd_spi_byte(0xFF);  /* CRC */
+    sd_spi_byte(0xFF); sd_spi_byte(0xFF);
 
-    Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);   /* CS deassert */
+    Xil_Out32(SD_BASE + SPI_SSR, 0xFFu);
     return 0;
 }
 
-/*
- * Test de diagnóstico de la SD — imprime resultados por UART.
- * Retorna 1 si la SD quedó lista, 0 si falló (el juego sigue igual).
- *
- * Secuencia:
- *   1. sd_init()  — negociación SPI + detección SDHC
- *   2. Leer sector 0 (MBR) — verifica que SCK/MOSI/MISO funcionen
- *   3. Comprobar firma MBR 0x55AA en bytes 510-511
- */
 static int sd_run_test(void)
 {
     xil_printf("\r\n=== SD TEST ===\r\n");
@@ -639,22 +746,17 @@ static int sd_run_test(void)
     int rc = sd_init();
     sd_init_rc = rc;
     if (rc == -1) {
-        xil_printf("FAIL CMD0: tarjeta no responde "
-                   "(verificar SD_RESET=0, SCK llega al pin B1)\r\n");
+        xil_printf("FAIL CMD0: tarjeta no responde\r\n");
         return 0;
     }
     if (rc == -2) {
-        xil_printf("FAIL ACMD41: tarjeta no sale de idle "
-                   "(timeout 200 intentos)\r\n");
+        xil_printf("FAIL ACMD41: tarjeta no sale de idle\r\n");
         return 0;
     }
-    xil_printf("PASS init: SD lista, tipo=%s\r\n",
-               sd_sdhc ? "SDHC/SDXC" : "SDSC");
+    xil_printf("PASS init: SD lista, tipo=%s\r\n", sd_sdhc ? "SDHC/SDXC" : "SDSC");
 
-    /* Pausa post-init: garantiza que la tarjeta esté lista antes del primer CMD17 */
     usleep(10000);
 
-    /* Leer sector 0 (MBR) */
     if (sd_read_block(0, sd_sector_buf) != 0) {
         xil_printf("FAIL read LBA0: CMD17 sin token de datos\r\n");
         return 0;
@@ -663,13 +765,11 @@ static int sd_run_test(void)
                sd_sector_buf[0], sd_sector_buf[1],
                sd_sector_buf[2], sd_sector_buf[3]);
 
-    /* Verificar firma MBR */
     if (sd_sector_buf[510] == 0x55 && sd_sector_buf[511] == 0xAA) {
         xil_printf("PASS MBR: firma 0x55AA encontrada\r\n");
     } else {
         xil_printf("WARN MBR: firma no encontrada "
-                   "(bytes 510-511 = %02X %02X) "
-                   "-- SD sin particionar o tarjeta en blanco\r\n",
+                   "(bytes 510-511 = %02X %02X)\r\n",
                    sd_sector_buf[510], sd_sector_buf[511]);
     }
 
@@ -684,12 +784,10 @@ static int sd_read_block_r(u32 lba, u8 *buf)
     return -1;
 }
 
-/* Carga los sprites desde los sectores reservados de la SD. */
 static void load_sprites(void)
 {
     if (!sd_ok) return;
 
-    /* Verificar magic "PONG" en sector cabecera */
     if (sd_read_block(SD_LBA_HDR, sd_sector_buf) != 0) return;
     u32 magic = ((u32)sd_sector_buf[0] << 24) | ((u32)sd_sector_buf[1] << 16) |
                 ((u32)sd_sector_buf[2] <<  8) |  (u32)sd_sector_buf[3];
@@ -726,7 +824,6 @@ static void load_sprites(void)
     load_step = 5;
     sprites_ok = 1;
 
-    /* mode_select: 160×90 4bpp = 7200 B = 15 sectores */
     dst = DDR2_SPR_MSEL;
     for (int s = 0; s < 22; s++) {
         if (sd_read_block_r(SD_LBA_MSEL + s, sd_sector_buf) != 0) return;
@@ -738,7 +835,6 @@ static void load_sprites(void)
     }
     msel_loaded = 1;
 
-    /* pause_menu: 200×80 4bpp = 8000 B = 16 sectores */
     dst = DDR2_SPR_PAUSE;
     for (int s = 0; s < 16; s++) {
         if (sd_read_block_r(SD_LBA_PAUSE + s, sd_sector_buf) != 0) return;
@@ -758,12 +854,10 @@ static void load_sprites(void)
 static void init_game(void)
 {
     u32 r = rng_next();
-    /* Posición Y aleatoria en la mitad central de la pantalla */
     ball.x  = mode_2p ? GAME_W / 2 : FB_W / 2;
     ball.y  = FB_H / 4 + (int)(r % (FB_H / 2));
-    /* Dirección X: alterna hacia el último perdedor (r bit 0); dy: 2–4 aleatorio */
     ball.dx = (r & 1u) ? 2 : -2;
-    ball.dy = (int)(1 + (rng_next() % 2));  /* 1 o 2 */
+    ball.dy = (int)(1 + (rng_next() % 2));
     if (rng_next() & 1u) ball.dy = -ball.dy;
     pad[0].y = (FB_H - PAD_H) / 2;
     pad[1].y = (FB_H - PAD_H) / 2;
@@ -771,13 +865,15 @@ static void init_game(void)
     hit_count    = 0;
     bounce_count = 0;
     needs_full_redraw = 1;
+
+    /* Resetear efectos al iniciar partida */
+    wave_active = 0;
+    flash_timer = 0;
 }
 
-/* Detección barrida: verdadero si la pelota tocó o cruzó la paleta este frame */
 static int collide(ball_t *b, int px, int py)
 {
-    /* Rango X que la pelota recorrió este frame (incluyendo posición previa) */
-    int x0 = b->x - b->dx;  /* posición antes del movimiento */
+    int x0   = b->x - b->dx;
     int xmin = x0 < b->x ? x0 : b->x;
     int xmax = x0 > b->x ? x0 + BALL_SZ : b->x + BALL_SZ;
     if (xmax <= px || xmin >= px + PAD_W) return 0;
@@ -800,38 +896,31 @@ static int check_score(void)
 static void move_local_pad(int p, int up)
 {
     pad[p].y += up ? -PAD_SPEED : PAD_SPEED;
-    if (pad[p].y < 0)           pad[p].y = 0;
+    if (pad[p].y < 0)            pad[p].y = 0;
     if (pad[p].y > FB_H - PAD_H) pad[p].y = FB_H - PAD_H;
 }
 
 static void move_ai(void)
 {
-    static int react_delay = 0;   /* frames que la IA tarda en reaccionar */
+    static int react_delay = 0;
     static int hit_offset  = PAD_H / 2;
-    static int aim_err     = 0;   /* error de puntería en px (persiste por rally) */
+    static int aim_err     = 0;
     static int last_dx_ai  = 0;
 
-    /* Contar rebotes para anti-loop */
     if ((ball.dx > 0 && last_dx_ai < 0) || (ball.dx < 0 && last_dx_ai > 0))
         bounce_count++;
 
-    /* Cuando la pelota empieza a venir hacia la IA: sortear reacción y puntería */
     if (ball.dx < 0 && last_dx_ai >= 0) {
         hit_offset = (int)(rng_next() % (PAD_H - BALL_SZ + 1));
-
-        /* 27 % de probabilidad de reacción tardía (33-55 frames perdidos).
-         * Con spd=3 y dx=7, la cobertura baja de ~273 px a ~108 px mínimo —
-         * la IA no puede alcanzar esquinas si sale con retraso. */
         if ((int)(rng_next() % 100) < 27) {
             react_delay = 33 + (int)(rng_next() % 23);
-            aim_err = (int)(rng_next() % 13) - 6;  /* ±6 px cuando llega tarde */
+            aim_err = (int)(rng_next() % 13) - 6;
         } else {
-            aim_err = (int)(rng_next() % 9) - 4;   /* ±4 px de imprecisión normal */
+            aim_err = (int)(rng_next() % 9) - 4;
         }
     }
     last_dx_ai = ball.dx;
 
-    /* Anti-loop: tras 8 rebotes sin gol, forzar zona opuesta del paddle */
     if (bounce_count >= 8) {
         bounce_count = 0;
         int mid = (PAD_H - BALL_SZ) / 2;
@@ -841,24 +930,17 @@ static void move_ai(void)
             hit_offset = 1 + (int)(rng_next() % (mid - 2));
     }
 
-    /* Retraso de reacción activo: la IA no se mueve aún */
     if (react_delay > 0) { react_delay--; return; }
 
-    /* Seguimiento: 3 px/frame.
-     * A dx=7 la pelota tarda ~91 frames en cruzar el campo; sin retraso
-     * la IA cubre ~273 px — suficiente para alcanzar cualquier punto si
-     * parte razonablemente cerca. Con 30 frames de retraso solo cubre ~183 px,
-     * dejando las esquinas vulnerables si la IA estaba lejos. */
     int target = ball.y + BALL_SZ / 2 - hit_offset + aim_err;
 
-    /* Snap al target cuando la distancia es menor que spd para evitar oscilación */
     if (ball.dx < 0) {
         int diff = target - pad[0].y;
         if      (diff >  3) pad[0].y += 3;
         else if (diff < -3) pad[0].y -= 3;
         else                pad[0].y += diff;
     } else {
-        int mid = (FB_H - PAD_H) / 2;
+        int mid  = (FB_H - PAD_H) / 2;
         int diff = mid - pad[0].y;
         if      (diff >  3) pad[0].y += 3;
         else if (diff < -3) pad[0].y -= 3;
@@ -893,6 +975,9 @@ static void move_ball(void)
                   (hit < 30) ? 1 : (hit < 32) ? 0 : (hit < 38) ? -1 :
                   (hit < 46) ? -1 : (hit < 54) ? -2 : -2;
         if (ball.x < PAD1_X + PAD_W + 2) ball.x = PAD1_X + PAD_W + 2;
+
+        /* ── EFECTOS de impacto: pad izquierdo ── */
+        on_paddle_hit(PAD1_X + PAD_W / 2, pad[0].y + PAD_H / 2, spd);
     }
 
     /* Colisión paleta derecha */
@@ -907,6 +992,9 @@ static void move_ball(void)
                       (hit < 30) ? 1 : (hit < 32) ? 0 : (hit < 38) ? -1 :
                       (hit < 46) ? -1 : (hit < 54) ? -2 : -2;
             if (ball.x > rpad_x - BALL_SZ - 2) ball.x = rpad_x - BALL_SZ - 2;
+
+            /* ── EFECTOS de impacto: pad derecho (coord pantalla) ── */
+            on_paddle_hit(PAD2_X + PAD_W / 2, pad[1].y + PAD_H / 2, spd);
         }
     }
 }
@@ -919,7 +1007,6 @@ static u32 btn_edge(void)
     u32 cur  = XGpio_DiscreteRead(&gpio0, 1) & 0x1Fu;
     u32 edge = cur & ~btn_prev;
     btn_prev = cur;
-    /* Suprimir BTN_C si BTN_U o BTN_D están activos en el mismo frame */
     if (cur & (BTN_U | BTN_D)) edge &= ~BTN_C;
     return edge;
 }
@@ -929,8 +1016,6 @@ static int sw_on(void)
     return (int)(XGpio_DiscreteRead(&gpio0, 2) & 0x1u);
 }
 
-/* Maestro → esclavo: estado completo del juego (8 bytes).
-   Recibe: pad[1].y del esclavo. */
 static void spi_exchange(void)
 {
     u8 tx[8], rx[8];
@@ -942,7 +1027,6 @@ static void spi_exchange(void)
     {
         int rc = XSpi_Transfer(&spi, tx, rx, 8);
         if (rc == XST_SUCCESS) {
-            /* rx[0] = pad[1].y>>1 (solo byte 0 es fiable en modo esclavo AXI SPI) */
             int remote_y = (int)rx[0] << 1;
             if (remote_y >= 0 && remote_y <= FB_H - PAD_H)
                 pad[1].y = remote_y;
@@ -961,7 +1045,6 @@ static void update_leds(void)
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void render_frame(void)
 {
-    /* Detectar cambio de estado */
     if (game_state != prev_game_state) {
         int was_game = (prev_game_state == ST_PLAYING || prev_game_state == ST_PAUSE);
         int is_game  = (game_state     == ST_PLAYING || game_state     == ST_PAUSE);
@@ -969,10 +1052,8 @@ static void render_frame(void)
             needs_full_redraw = 1;
             score_dirty       = 1;
         }
-        /* Al reanudar desde pausa: limpiar overlay */
         if (prev_game_state == ST_PAUSE && game_state == ST_PLAYING)
             needs_full_redraw = 1;
-        /* Al entrar en pausa: forzar redibujado del overlay */
         if (game_state == ST_PAUSE)
             prev_selected = -1;
         prev_game_state = game_state;
@@ -985,7 +1066,6 @@ static void render_frame(void)
         if (needs_full_redraw) {
             fb_clear(COL_BLACK);
             if (load_step >= 4)
-                /* 64×13 px × scale 5 = 320×65 px, centrado en 640 */
                 fb_blit_scaled(160, 30, SPR_LOGO_W, 13, DDR2_SPR_LOGO, 1, 5);
             else
                 fb_draw_str(221, 30, "PONG", 12, COL_WHITE);
@@ -994,9 +1074,6 @@ static void render_frame(void)
         }
         if (prev_selected != selected) {
             if (msel_loaded) {
-                /* Sprite mode_select 200×112 × scale2 = 400×224, x=120 y=128 */
-                /* Cluster 1P: stored y=22-36 → display y=172-200 */
-                /* Cluster 2P: stored y=55-69 → display y=238-266 */
                 fb_fill_rect(120, 128, 400, 224, COL_BLACK);
                 if (selected==0) fb_fill_rect(120, 167, 400, 38, COL_BLUE);
                 else             fb_fill_rect(120, 233, 400, 38, COL_BLUE);
@@ -1016,6 +1093,10 @@ static void render_frame(void)
     case ST_PAUSE:
         if (needs_full_redraw) {
             fb_clear(COL_BLACK);
+
+            /* 4. SCANLINES CRT — solo en redibujado completo */
+            draw_scanlines();
+
             if (!mode_2p)
                 for (int ny = 0; ny < FB_H; ny += 8)
                     fb_fill_rect(318, ny, 4, 4, COL_GRAY);
@@ -1026,16 +1107,20 @@ static void render_frame(void)
                 int bvis = mode_2p ? (is_slave ? (ball.x >= FB_W) : (ball.x < FB_W)) : 1;
                 if (bvis) fb_fill_rect(bsx, ball.y, BALL_SZ, BALL_SZ, COL_WHITE);
             }
+            /* 1. PALETAS CON COLOR ARCOÍRIS */
             if (!mode_2p || !is_slave)
-                fb_fill_rect(PAD1_X, pad[0].y, PAD_W, PAD_H, COL_WHITE);
+                fb_fill_rect(PAD1_X, pad[0].y, PAD_W, PAD_H,
+                             rainbow_colors[rainbow_index]);
             if (!mode_2p || is_slave)
-                fb_fill_rect(PAD2_X, pad[1].y, PAD_W, PAD_H, COL_WHITE);
+                fb_fill_rect(PAD2_X, pad[1].y, PAD_W, PAD_H,
+                             rainbow_colors[rainbow_index]);
+
             prev_ball_x = ball.x; prev_ball_y = ball.y;
             prev_pad0_y = pad[0].y; prev_pad1_y = pad[1].y;
             needs_full_redraw = 0;
+
             if (game_state == ST_PAUSE) {
                 if (pause_loaded) {
-                    /* pause sprite 200×80 ×2 = 400×160, centrado: x=120 y=160 */
                     fb_fill_rect(120, 160, 400, 160, COL_BLACK);
                     if (selected==0) fb_fill_rect(120, 175, 400, 49, COL_BLUE);
                     else             fb_fill_rect(120, 255, 400, 49, COL_BLUE);
@@ -1051,7 +1136,7 @@ static void render_frame(void)
             break;
         }
 
-        /* Render incremental de la pelota (coordenadas de pantalla según rol) */
+        /* Render incremental de la pelota */
         {
             int old_bsx, new_bsx, old_vis, new_vis;
             if (!mode_2p) {
@@ -1110,7 +1195,6 @@ static void render_frame(void)
                         }
                     }
                 } else if (old_vis) {
-                    /* Pelota salió de esta pantalla: borrar posición anterior */
                     int lpad_x2 = (!mode_2p || !is_slave) ? PAD1_X : -99;
                     int lpad_y2 = (!mode_2p || !is_slave) ? pad[0].y : 0;
                     int rpad_x2 = (!mode_2p || is_slave)  ? PAD2_X : -99;
@@ -1129,44 +1213,52 @@ static void render_frame(void)
                         fb_fill_rect(old_bsx, old_by, BALL_SZ, BALL_SZ, COL_BLACK);
                     }
                 } else {
-                    /* Pelota entró en esta pantalla: dibujar nueva posición */
                     fb_fill_rect(new_bsx, ball.y, BALL_SZ, BALL_SZ, COL_WHITE);
                 }
             }
         }
-        /* Delta-rect paddles: solo la paleta propia de este FPGA */
+
+        /* Delta-rect paddles con color arcoíris */
         if ((!mode_2p || !is_slave) && pad[0].y != prev_pad0_y) {
+            u8 pc = rainbow_colors[rainbow_index];
             int dy = pad[0].y - prev_pad0_y;
             if (dy < 0 && -dy < PAD_H) {
-                fb_fill_rect(PAD1_X, pad[0].y,         PAD_W, -dy, COL_WHITE);
+                fb_fill_rect(PAD1_X, pad[0].y,         PAD_W, -dy, pc);
                 fb_fill_rect(PAD1_X, pad[0].y + PAD_H, PAD_W, -dy, COL_BLACK);
             } else if (dy > 0 && dy < PAD_H) {
                 fb_fill_rect(PAD1_X, prev_pad0_y,         PAD_W, dy, COL_BLACK);
-                fb_fill_rect(PAD1_X, prev_pad0_y + PAD_H, PAD_W, dy, COL_WHITE);
+                fb_fill_rect(PAD1_X, prev_pad0_y + PAD_H, PAD_W, dy, pc);
             } else {
                 fb_fill_rect(PAD1_X, prev_pad0_y, PAD_W, PAD_H, COL_BLACK);
-                fb_fill_rect(PAD1_X, pad[0].y,    PAD_W, PAD_H, COL_WHITE);
+                fb_fill_rect(PAD1_X, pad[0].y,    PAD_W, PAD_H, pc);
             }
             prev_pad0_y = pad[0].y;
         }
         if ((!mode_2p || is_slave) && pad[1].y != prev_pad1_y) {
+            u8 pc = rainbow_colors[rainbow_index];
             int dy = pad[1].y - prev_pad1_y;
             if (dy < 0 && -dy < PAD_H) {
-                fb_fill_rect(PAD2_X, pad[1].y,         PAD_W, -dy, COL_WHITE);
+                fb_fill_rect(PAD2_X, pad[1].y,         PAD_W, -dy, pc);
                 fb_fill_rect(PAD2_X, pad[1].y + PAD_H, PAD_W, -dy, COL_BLACK);
             } else if (dy > 0 && dy < PAD_H) {
                 fb_fill_rect(PAD2_X, prev_pad1_y,         PAD_W, dy, COL_BLACK);
-                fb_fill_rect(PAD2_X, prev_pad1_y + PAD_H, PAD_W, dy, COL_WHITE);
+                fb_fill_rect(PAD2_X, prev_pad1_y + PAD_H, PAD_W, dy, pc);
             } else {
                 fb_fill_rect(PAD2_X, prev_pad1_y, PAD_W, PAD_H, COL_BLACK);
-                fb_fill_rect(PAD2_X, pad[1].y,    PAD_W, PAD_H, COL_WHITE);
+                fb_fill_rect(PAD2_X, pad[1].y,    PAD_W, PAD_H, pc);
             }
             prev_pad1_y = pad[1].y;
         }
 
         prev_ball_x = ball.x; prev_ball_y = ball.y;
 
-        /* Overlay de pausa: solo en maestro */
+        /* 3. ONDA ROMBO — se dibuja incremental, solo el perímetro */
+        draw_wave();
+
+        /* 2. FLASH DE IMPACTO */
+        draw_flash();
+
+        /* Overlay de pausa */
         if (!is_slave && game_state == ST_PAUSE && prev_selected != selected) {
             if (pause_loaded) {
                 fb_fill_rect(120, 160, 400, 160, COL_BLACK);
@@ -1198,15 +1290,12 @@ static void render_frame(void)
         if (needs_full_redraw) {
             fb_clear(COL_BLACK);
             {
-                /* TOP=P1Wins, MID=P2Wins, BOT=ComputerWins
-                   selected: 0=izq gana, 1=der gana */
                 int sec;
                 if (!mode_2p)
-                    sec = (selected == 1) ? 0 : 2; /* 1P: humano=P1Wins, IA=ComputerWins */
+                    sec = (selected == 1) ? 0 : 2;
                 else
-                    sec = (selected == 1) ? 0 : 1; /* 2P: maestro=P1Wins, esclavo=P2Wins */
+                    sec = (selected == 1) ? 0 : 1;
                 const u8 *spr = DDR2_SPR_GAMEOVER + sec * SPR_GO_SEC_BYTES;
-                /* 200×75 ×3 = 600×225, centrado: x=20 y=90 */
                 fb_blit_scaled(20, 90, SPR_GO_W, SPR_GO_SEC_H, spr, 0, 3);
             }
             needs_full_redraw = 0;
@@ -1221,23 +1310,15 @@ static void render_frame(void)
 
 static void ddr2_init(void)
 {
-    /* MIG 7-series calibra solo al arrancar; calib_done sale en LED[15].
-     * Sin señal accesible al CPU, se espera el peor caso documentado. */
     usleep(350000);
 }
 
-/*
- * Escribe 4 patrones en DDR2 y los lee de vuelta.
- * Muestra en LED[3:0] qué palabras pasaron (bit N = palabra N OK).
- * LED[15] = calib_done (siempre encendido si MIG calibró).
- * Resultado visible 2 segundos antes de que arranque el juego.
- */
 static void ddr2_selftest(void)
 {
     static const u32 pat[4] = {
         0xDEADBEEFu, 0x12345678u, 0xA5A5A5A5u, 0x0F0F0F0Fu
     };
-    u32 base = DDR2_BASE + 0x20000UL;   /* 128 KB dentro de DDR2, lejos del código */
+    u32 base = DDR2_BASE + 0x20000UL;
     u32 result = 0;
 
     for (int i = 0; i < 4; i++)
@@ -1247,16 +1328,13 @@ static void ddr2_selftest(void)
         if (Xil_In32(base + (u32)(i * 4)) == pat[i])
             result |= (1u << i);
 
-    /* Mostrar en LED[3:0]: cada bit = palabra i correcta */
     XGpio_DiscreteWrite(&gpio1, 1, result);
-    usleep(2000000);   /* 2 s para que el usuario vea los LEDs */
+    usleep(2000000);
     XGpio_DiscreteWrite(&gpio1, 1, 0);
 }
 
 static void ddr2_sprite_defaults(void)
 {
-    /* Ball y paddle: blanco sólido (nibble COL_WHITE=1 → byte 0x11).
-     * Logo: negro/transparente hasta que la SD esté lista. */
     u32 addr;
     int i;
 
@@ -1276,44 +1354,22 @@ static void ddr2_sprite_defaults(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * DIAG_STRIPES — test de 8 franjas iguales, cada una de FB_H/8 = 60 filas
- *   Esperado en monitor 640×480:
- *     franja 0 (azul)    : filas   0 –  59
- *     franja 1 (rojo)    : filas  60 – 119
- *     franja 2 (verde)   : filas 120 – 179
- *     franja 3 (amarillo): filas 180 – 239
- *     franja 4 (blanco)  : filas 240 – 299
- *     franja 5 (naranja) : filas 300 – 359
- *     franja 6 (gris)    : filas 360 – 419
- *     franja 7 (magenta) : filas 420 – 479
- *   Cada franja tiene un borde blanco de 2px arriba y 2px abajo como referencia.
- *   Si se ven < 8 franjas, reportar cuántas y cuántas filas ocupa la primera.
- * ═══════════════════════════════════════════════════════════════════════════ */
-/* ═══════════════════════════════════════════════════════════════════════════
- * SLAVE_LOOP — loop dedicado del esclavo (pantalla derecha, 2P).
- * Reconfigura SPI como esclavo, hace handshake y entra en bucle de render.
- * Nunca regresa.
+ * SLAVE_LOOP
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void slave_loop(void)
 {
-    /* Reconfigurar SPI como esclavo */
     XSpi_Stop(&spi);
     XSpi_SetOptions(&spi, XSP_MANUAL_SSELECT_OPTION);
     XSpi_Start(&spi);
     XSpi_IntrGlobalDisable(&spi);
 
-    /* Pantalla de espera */
     fb_clear(COL_BLACK);
     fb_draw_str(200, 190, "JUGADOR 2", 6, COL_WHITE);
     fb_draw_str(110, 270, "ESPERANDO JUGADOR 1...", 3, COL_GRAY);
 
-    /* Handshake no bloqueante: polling manual FIFO con salida BTN_C */
     {
-        /* Esperar que BTN_C se suelte (venía presionado del menú) */
         while (XGpio_DiscreteRead(&gpio0, 1) & BTN_C) wait_vsync();
 
-        /* Forzar modo esclavo desde el inicio: MANSS|SPE, sin MASTER ni INHIBIT.
-           Leer SPISR limpia MODF si quedó de la configuración de maestro. */
         (void)Xil_In32(SPI2P_BASE + SPI_SR);
         u32 cr = SPICR_MANSS | SPICR_SPE;
         Xil_Out32(SPI2P_BASE + SPI_CR, cr | SPICR_TXRST | SPICR_RXRST);
@@ -1322,14 +1378,11 @@ static void slave_loop(void)
         u32 prev_lvl = 0;
         while (1) {
             u32 sr = Xil_In32(SPI2P_BASE + SPI_SR);
-
-            /* Pre-cargar TX con SPI_PONG si el FIFO está vacío */
             if (sr & SPISR_TX_EMPTY)
                 Xil_Out32(SPI2P_BASE + SPI_DTR, (u32)SPI_PONG);
 
             wait_vsync();
 
-            /* BTN_C flanco ascendente → salir al menú */
             u32 cur_lvl = XGpio_DiscreteRead(&gpio0, 1) & 0x1Fu;
             if ((cur_lvl & BTN_C) && !(prev_lvl & BTN_C)) {
                 Xil_Out32(SPI2P_BASE + SPI_CR, cr | SPICR_INHIBIT);
@@ -1337,7 +1390,6 @@ static void slave_loop(void)
             }
             prev_lvl = cur_lvl;
 
-            /* ¿El maestro mandó un byte? */
             if (!(Xil_In32(SPI2P_BASE + SPI_SR) & SPISR_RX_EMPTY)) {
                 u8 rx = (u8)Xil_In32(SPI2P_BASE + SPI_DRR);
                 if (rx == SPI_PING) break;
@@ -1346,7 +1398,6 @@ static void slave_loop(void)
         Xil_Out32(SPI2P_BASE + SPI_CR, cr | SPICR_INHIBIT);
     }
 
-    /* Game loop: forzar CR a estado conocido esclavo, limpiar MODF leyendo SPISR */
     {
         (void)Xil_In32(SPI2P_BASE + SPI_SR);
         u32 c = SPICR_MANSS | SPICR_SPE;
@@ -1365,8 +1416,6 @@ static void slave_loop(void)
         u32 gl_prev  = 0;
         u8  slv_btnc = 0;
 
-        /* Precargar TX: byte0 = pad[1].y>>1 (cabe en uint8; AXI SPI slave solo
-           garantiza byte 0 del FIFO en cada transferencia) */
         Xil_Out32(SPI2P_BASE + SPI_DTR, (u32)(pad[1].y >> 1));
         Xil_Out32(SPI2P_BASE + SPI_DTR, 0u);
         Xil_Out32(SPI2P_BASE + SPI_DTR, 0u);
@@ -1379,8 +1428,6 @@ static void slave_loop(void)
         while (1) {
         u32 lvl = XGpio_DiscreteRead(&gpio0, 1) & 0x1Fu;
 
-        /* BTN_C flanco ascendente — solo señalizar al maestro; nunca salir localmente
-           en ST_GAMEOVER (el maestro manda ST_MENU cuando corresponde salir) */
         if ((lvl & BTN_C) && !(gl_prev & BTN_C) && !(lvl & (BTN_U | BTN_D))) {
             if (game_state == ST_PLAYING || game_state == ST_PAUSE)
                 slv_btnc = 1;
@@ -1395,8 +1442,6 @@ static void slave_loop(void)
         update_leds();
         render_frame();
 
-        /* Recargar TX sin TXRST. Byte 0 = pad[1].y>>1; bytes 1-7 = 0.
-           Solo byte 0 es fiable en modo esclavo AXI SPI. */
         Xil_Out32(SPI2P_BASE + SPI_DTR, (u32)(pad[1].y >> 1));
         Xil_Out32(SPI2P_BASE + SPI_DTR, (u32)slv_btnc);
         Xil_Out32(SPI2P_BASE + SPI_DTR, 0u);
@@ -1405,8 +1450,6 @@ static void slave_loop(void)
         Xil_Out32(SPI2P_BASE + SPI_DTR, 0u);
         Xil_Out32(SPI2P_BASE + SPI_DTR, 0u);
 
-        /* Drenar RX DESPUÉS del TX reload: slv_btnc ya fue cargado en FIFO antes
-           de que rx_drain lo limpie. Solo aceptar estados válidos del maestro. */
         {
             u8 tmp[16];
             int n = 0;
@@ -1432,11 +1475,10 @@ static void slave_loop(void)
         }
 
         wait_vsync();
-        } /* while(1) */
+        }
     }
 
 slave_exit:
-    /* Restaurar SPI como maestro y volver al menú */
     XSpi_Stop(&spi);
     XSpi_SetOptions(&spi, XSP_MASTER_OPTION | XSP_MANUAL_SSELECT_OPTION);
     XSpi_SetSlaveSelect(&spi, 0x01u);
@@ -1455,16 +1497,13 @@ int main(void)
 {
     xil_printf("\r\n=== PONG BOOT ===\r\n");
 
-    /* GPIO0: botones (ch1 in) + SW (ch2 in) */
     XGpio_Initialize(&gpio0, XPAR_AXI_GPIO_0_BASEADDR);
-    XGpio_SetDataDirection(&gpio0, 1, 0x3Fu);  /* 6 bits entrada: [5]=vsync [4:0]=botones */
+    XGpio_SetDataDirection(&gpio0, 1, 0x3Fu);
     XGpio_SetDataDirection(&gpio0, 2, 0x01u);
 
-    /* GPIO1: LEDs (ch1 out) */
     XGpio_Initialize(&gpio1, XPAR_AXI_GPIO_1_BASEADDR);
     XGpio_SetDataDirection(&gpio1, 1, 0x0000u);
 
-    /* SPI0: inter-FPGA (maestro, polling) */
     XSpi_Config *spi_cfg = XSpi_LookupConfig(XPAR_AXI_QUAD_SPI_0_BASEADDR);
     XSpi_CfgInitialize(&spi, spi_cfg, spi_cfg->BaseAddress);
     XSpi_SetOptions(&spi, XSP_MASTER_OPTION | XSP_MANUAL_SSELECT_OPTION);
@@ -1472,7 +1511,6 @@ int main(void)
     XSpi_Start(&spi);
     XSpi_IntrGlobalDisable(&spi);
 
-    /* DDR2: esperar calibración MIG, verificar R/W y cargar sprites por defecto */
     xil_printf("INFO: DDR2 init...\r\n");
     ddr2_init();
     xil_printf("INFO: DDR2 selftest...\r\n");
@@ -1480,23 +1518,20 @@ int main(void)
     xil_printf("INFO: DDR2 sprites...\r\n");
     ddr2_sprite_defaults();
 
-    /* Estado inicial */
     game_state = ST_MENU;
     selected   = 0;
     mode_2p    = 0;
     score[0]   = score[1] = 0;
     init_game();
-    usleep(500000);   /* 500 ms power-up SD antes de init SPI */
+    usleep(500000);
     sd_ok = sd_run_test();
     load_sprites();
 
-    /* Frame inicial del menú */
     render_frame();
 
     while (1) {
         u32 btn = btn_edge();
 
-        /* Leer pad[1].y del esclavo ANTES de move_ball para 0 frames de lag en colisión */
         if (mode_2p && game_state != ST_WAIT_2P) {
             spi_exchange();
             if (game_state == ST_MENU) { mode_2p = 0; is_slave = 0; }
@@ -1504,7 +1539,6 @@ int main(void)
 
         switch (game_state) {
 
-        /* ── MENÚ PRINCIPAL ─────────────────────────────────────────────── */
         case ST_MENU:
             if (btn & BTN_U) selected = 0;
             if (btn & BTN_D) selected = 1;
@@ -1513,11 +1547,11 @@ int main(void)
                 score[0] = score[1] = 0;
                 init_game();
                 if (mode_2p) {
-                    is_slave = sw_on();   /* SW0=0 → maestro, SW0=1 → esclavo */
+                    is_slave = sw_on();
                     if (is_slave) {
-                        slave_loop();     /* regresa si BTN_C */
+                        slave_loop();
                     }
-                    if (mode_2p) {        /* si slave salió, mode_2p=0 → skip */
+                    if (mode_2p) {
                         game_state        = ST_WAIT_2P;
                         needs_full_redraw = 1;
                     }
@@ -1527,7 +1561,6 @@ int main(void)
             }
             break;
 
-        /* ── ESPERA 2P (maestro) ─────────────────────────────────────── */
         case ST_WAIT_2P: {
             if (btn & BTN_C) {
                 mode_2p = 0; is_slave = 0;
@@ -1544,19 +1577,17 @@ int main(void)
             break;
         }
 
-        /* ── JUGANDO ────────────────────────────────────────────────────── */
         case ST_PLAYING:
             {
                 u32 lvl = XGpio_DiscreteRead(&gpio0, 1) & 0x1Fu;
-                /* Ignorar BTN_C si se presiona junto con movimiento (evita activación accidental) */
                 if ((btn & BTN_C) && !(lvl & (BTN_U | BTN_D))) {
                     selected = 0; game_state = ST_PAUSE; break;
                 }
                 if (mode_2p) {
-                    if (lvl & BTN_U) move_local_pad(0, 1);  /* maestro: paleta izquierda */
+                    if (lvl & BTN_U) move_local_pad(0, 1);
                     if (lvl & BTN_D) move_local_pad(0, 0);
                 } else {
-                    if (lvl & BTN_U) move_local_pad(1, 1);  /* 1P: paleta derecha */
+                    if (lvl & BTN_U) move_local_pad(1, 1);
                     if (lvl & BTN_D) move_local_pad(1, 0);
                 }
             }
@@ -1569,18 +1600,15 @@ int main(void)
             if (check_score()) game_state = ST_GAMEOVER;
             break;
 
-        /* ── PAUSA (0=Reanudar, 1=Salir) ───────────────────────────────── */
         case ST_PAUSE:
             if (btn & BTN_U) selected = 0;
             if (btn & BTN_D) selected = 1;
             if (btn & BTN_C) {
                 game_state = (selected == 0) ? ST_PLAYING : ST_MENU;
                 if (selected != 0) selected = 0;
-                /* mode_2p/is_slave se limpian en after-switch cuando game_state==ST_MENU */
             }
             break;
 
-        /* ── GAMEOVER ───────────────────────────────────────────────────── */
         case ST_GAMEOVER:
             if (btn & BTN_C) { game_state = ST_MENU; selected = 0; }
             break;
