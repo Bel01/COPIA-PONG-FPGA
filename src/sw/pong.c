@@ -217,7 +217,7 @@ static int   wave_y      = 0;
 static int   wave_r      = 0;   /* radio actual en píxeles Manhattan */
 static int   wave_speed  = 0;   /* expansión px/frame según velocidad de la bola */
 #define WAVE_THICK  2            /* grosor del borde del rombo en píxeles */
-#define WAVE_MAX_R  140          /* radio máximo: ondulación local, NO cubre toda la pantalla */
+#define WAVE_MAX_R  240          /* radio máximo: ondulación local, NO cubre toda la pantalla */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * RENDERER — escritura al framebuffer BRAM
